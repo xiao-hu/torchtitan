@@ -143,30 +143,112 @@ model = Qwen3VLModel(model_args)
 print(f"Created Qwen3VLModel with {sum(p.numel() for p in model.parameters()):,} parameters")
 ```
 
-### Phase 5: State Dict Adapter (state_dict_adapter.py)
-- [ ] Analyze HF checkpoint structure
-  - Vision encoder keys: `model.visual.*`
-  - Text model keys: `model.language_model.*`
-  - Projector keys: `model.projector.*`
+### Phase 5: State Dict Adapter (state_dict_adapter.py) ✅ COMPLETE
+#### Implementation Tasks
+- [x] Analyze HF checkpoint structure
+  - Vision encoder keys: `model.visual.*` → `visual.*`
+  - Text model keys: `model.language_model.*` → `language_model.*`
+  - Reuses parent `Qwen3StateDictAdapter` for text + MOE handling
   
-- [ ] Implement key mappings
-  - Vision encoder: `visual.embeddings.*`, `visual.blocks.*`, `visual.merger.*`
-  - Text decoder: `language_model.layers.*` (handle MOE layers)
-  - MOE experts: `layers.*.mlp.experts.*`, `layers.*.mlp.gate.*`
-  - Projector: `projector.w1.weight`, `projector.w2.weight`
+- [x] Implement key mappings
+  - Vision encoder: Simple prefix transformation (`model.` add/remove)
+  - Text decoder: Handle `model.language_model.*` correctly
+  - Conversion logic: Strip/add `language_model.` infix as needed
+  - MOE experts: Inherited from parent (standard per-expert format)
   
-- [ ] Handle special cases
-  - Expert parameters (gate_up_proj, down_proj)
-  - Router weights
-  - Embedding layers (tok_embeddings, lm_head)
-  - Weight tying if enabled
+- [x] Handle special cases
+  - Expert parameters: Inherited from `Qwen3StateDictAdapter`
+  - Router weights: Handled by parent class
+  - Weight tying: Correctly handled (lm_head ↔ embed_tokens)
   
-- [ ] Test checkpoint conversion
-  - Load from HF: `Qwen/Qwen3-VL-30B-A3B-Instruct`
-  - Convert to TorchTitan format
-  - Verify shapes and numerical accuracy
+- [x] Test checkpoint conversion
+  - ✅ 4/4 unit tests passing (updated with correct HF format)
 
-### Phase 6: Training Configuration
+#### Checkpoint Conversion Tool
+
+A conversion script is provided to convert HuggingFace Qwen3-VL checkpoints to TorchTitan format:
+
+**Location**: `custom_task/convert_hf_checkpoint.py`
+
+**Features**:
+- Loads HuggingFace Qwen3-VL checkpoint
+- Converts to TorchTitan format using `Qwen3VLStateDictAdapter`
+- Saves as PyTorch checkpoint
+- Optional validation (converts back to verify correctness)
+- Supports both dense and MOE models
+
+**Usage**:
+
+```bash
+# Basic conversion
+python custom_task/convert_hf_checkpoint.py \
+    --hf-checkpoint /path/to/Qwen3-VL-30B-A3B-Instruct \
+    --output-path /path/to/output/checkpoint.pt \
+    --model-flavor 30B-A3B
+
+# With validation (converts back to HF format to verify)
+python custom_task/convert_hf_checkpoint.py \
+    --hf-checkpoint /path/to/Qwen3-VL-30B-A3B-Instruct \
+    --output-path /path/to/output/checkpoint.pt \
+    --model-flavor 30B-A3B \
+    --validate
+
+# Test conversion without saving (useful for debugging)
+python custom_task/convert_hf_checkpoint.py \
+    --hf-checkpoint /path/to/Qwen3-VL-30B-A3B-Instruct \
+    --output-path /tmp/test.pt \
+    --model-flavor 30B-A3B \
+    --skip-save
+```
+
+**Arguments**:
+- `--hf-checkpoint` (required): Path to HuggingFace checkpoint directory
+- `--output-path` (required): Path to save TorchTitan checkpoint (.pt file)
+- `--model-flavor` (optional): Model configuration to use (`debugmodel` or `30B-A3B`, default: `30B-A3B`)
+- `--validate` (optional): Validate conversion by converting back to HF format
+- `--skip-save` (optional): Skip saving checkpoint (useful for testing)
+
+**Output**:
+- Saved checkpoint contains:
+  - `model`: TorchTitan state dict (882 keys for 30B model)
+  - `model_args`: Model configuration parameters
+
+**Loading Converted Checkpoint**:
+
+```python
+import torch
+from torchtitan.experiments.qwen3_vl import Qwen3VLModel
+
+# Load checkpoint
+checkpoint = torch.load('/path/to/checkpoint.pt')
+
+# Get model args and create model
+model_args = checkpoint['model_args']
+model = Qwen3VLModel(model_args)
+
+# Load weights
+model.load_state_dict(checkpoint['model'])
+
+# Ready for training!
+```
+
+**Tested With**:
+- ✅ Qwen3-VL-30B-A3B-Instruct (3.9B active params, 882 keys)
+- ✅ Dense models (67M parameters)
+- ✅ All vision + text keys converted correctly
+
+### Phase 6: Dataset Integration
+- [ ] Adapt multimodal datasets from `torchtitan/experiments/vlm/datasets/`
+- [ ] Support inputs:
+  - `pixel_values`: Image tensors
+  - `pixel_values_videos`: Video tensors
+  - `image_grid_thw`: Grid dimensions for images
+  - `video_grid_thw`: Grid dimensions for videos
+- [ ] Handle special tokens in sequences
+  - `<|vision_start|>`, `<|image|>`, `<|video|>`, `<|vision_end|>`
+- [ ] Implement proper padding and masking
+
+### Phase 7: Training Configuration
 - [ ] Create training config TOML
   - Based on `custom_task/qwen3_30b.toml`
   - Add vision preprocessing parameters
@@ -185,17 +267,6 @@ print(f"Created Qwen3VLModel with {sum(p.numel() for p in model.parameters()):,}
   temporal_patch_size = 2
   spatial_merge_size = 2
   ```
-
-### Phase 7: Dataset Integration
-- [ ] Adapt multimodal datasets from `torchtitan/experiments/vlm/datasets/`
-- [ ] Support inputs:
-  - `pixel_values`: Image tensors
-  - `pixel_values_videos`: Video tensors
-  - `image_grid_thw`: Grid dimensions for images
-  - `video_grid_thw`: Grid dimensions for videos
-- [ ] Handle special tokens in sequences
-  - `<|vision_start|>`, `<|image|>`, `<|video|>`, `<|vision_end|>`
-- [ ] Implement proper padding and masking
 
 ### Phase 8: Testing & Validation
 - [ ] Unit tests

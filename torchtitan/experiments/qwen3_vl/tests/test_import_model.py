@@ -9,7 +9,6 @@ Test suite for Qwen3 VL model imports and configuration.
 """
 
 import pytest
-import torch
 
 
 def _has_transformers():
@@ -26,14 +25,12 @@ class TestQwen3VLImports:
 
     def test_imports(self):
         """Test that all main components can be imported."""
-        from torchtitan.experiments.qwen3_vl import (
-            Qwen3VLModel,
-            Qwen3VLModelArgs,
-            Qwen3VLTextModel,
-            Qwen3VLVisionArgs,
-            SpecialTokens,
-            qwen3_vl_args,
-        )
+        from torchtitan.experiments.qwen3_vl import (Qwen3VLModel,
+                                                     Qwen3VLModelArgs,
+                                                     Qwen3VLTextModel,
+                                                     Qwen3VLVisionArgs,
+                                                     SpecialTokens,
+                                                     qwen3_vl_args)
 
         # Verify all exports are accessible
         assert Qwen3VLModel is not None

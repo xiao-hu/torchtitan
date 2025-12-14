@@ -15,14 +15,16 @@ Contains the core model architecture combining:
 """
 
 from .args import Qwen3VLModelArgs, Qwen3VLVisionArgs, SpecialTokens
-from .vision import Qwen3VLVisionEncoder
 from .model import Qwen3VLModel, Qwen3VLTextModel
+from .state_dict_adapter import Qwen3VLStateDictAdapter
+from .vision import Qwen3VLVisionEncoder
 
 __all__ = [
-    'Qwen3VLModelArgs',
-    'Qwen3VLVisionArgs',
-    'SpecialTokens',
-    'Qwen3VLVisionEncoder',
-    'Qwen3VLModel',
-    'Qwen3VLTextModel',
+    "Qwen3VLModel",
+    "Qwen3VLTextModel",
+    "Qwen3VLModelArgs",
+    "Qwen3VLVisionArgs",
+    "Qwen3VLVisionEncoder",
+    "Qwen3VLStateDictAdapter",
+    "SpecialTokens",
 ]

@@ -25,7 +25,6 @@ from torchtitan.models.qwen3.model.model import Qwen3Model
 from .args import Qwen3VLModelArgs
 from .vision import Qwen3VLVisionEncoder
 
-
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================

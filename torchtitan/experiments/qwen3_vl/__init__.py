@@ -17,14 +17,18 @@ combining:
 
 from torchtitan.models.moe import MoEArgs
 
-from .model import Qwen3VLModel, Qwen3VLTextModel
-from .model.args import Qwen3VLModelArgs, Qwen3VLVisionArgs, SpecialTokens
+# Import all components from model subpackage
+from .model import (Qwen3VLModel, Qwen3VLModelArgs, Qwen3VLStateDictAdapter,
+                    Qwen3VLTextModel, Qwen3VLVisionArgs, Qwen3VLVisionEncoder,
+                    SpecialTokens)
 
 __all__ = [
     "Qwen3VLModel",
     "Qwen3VLTextModel",
+    "Qwen3VLStateDictAdapter",
     "Qwen3VLModelArgs",
     "Qwen3VLVisionArgs",
+    "Qwen3VLVisionEncoder",
     "SpecialTokens",
     "qwen3_vl_args",
 ]
