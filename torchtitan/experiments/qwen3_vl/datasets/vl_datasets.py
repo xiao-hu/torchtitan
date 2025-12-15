@@ -14,7 +14,6 @@ but for multimodal (vision + text) data.
 from functools import partial
 from typing import Any, Callable, Dict
 
-import torch
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
@@ -25,7 +24,6 @@ from torchtitan.config import JobConfig
 from torchtitan.experiments.vlm.datasets.utils.packing import SamplePacker
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
-
 
 # ============================================================================
 # Dataset Loaders
@@ -92,13 +90,13 @@ def format_vqav2_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
 
 VL_DATASETS = {
     "vqav2": DatasetConfig(
-        path="HuggingFaceM4/VQAv2",
-        loader=partial(_load_hf_dataset, split="train"),
+        path="lmms-lab/VQAv2",
+        loader=partial(_load_hf_dataset, split="validation"),
         sample_processor=format_vqav2_sample,
     ),
     "vqav2_validation": DatasetConfig(
-        path="HuggingFaceM4/VQAv2",
-        loader=partial(_load_hf_dataset, split="validation"),
+        path="lmms-lab/VQAv2",
+        loader=partial(_load_hf_dataset, split="test"),
         sample_processor=format_vqav2_sample,
     ),
     # Add more VL datasets here following the same pattern:
@@ -365,7 +363,8 @@ def build_vl_dataloader(
     seq_len = job_config.training.seq_len
 
     # Get packing configuration (default: disabled)
-    packing_buffer_size = getattr(job_config.data, "packing_buffer_size", 0)
+    # Since JobConfig doesn't have a data attribute, we default to 0 (disabled)
+    packing_buffer_size = 0
 
     hf_vl_ds = HuggingFaceVLDataset(
         dataset_name=dataset_name,

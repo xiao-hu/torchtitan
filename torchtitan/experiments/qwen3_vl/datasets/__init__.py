@@ -14,7 +14,6 @@ This module contains all dataset infrastructure for Qwen3-VL:
 Architecture:
     torchtitan/experiments/qwen3_vl/datasets/
     ├── vl_datasets.py                          # Generic VL infrastructure (EXPERIMENTAL)
-    ├── rope2d.py                               # 3D RoPE (from official Qwen3-VL)
     ├── data_processor.py                       # Preprocessing (from official Qwen3-VL)
     └── __init__.py                             # This file
 
@@ -43,23 +42,14 @@ Usage Example:
     ... )
 """
 
-# Generic VL infrastructure (EXPERIMENTAL - may move to torchtitan/hf_datasets/)
-from .vl_datasets import (
-    VL_DATASETS,
-    HuggingFaceVLDataset,
-    build_vl_dataloader,
-    format_vqav2_sample,
-)
-
 # Qwen3-VL specific preprocessing (verbatim from official implementation)
-from .data_processor import (
-    IGNORE_INDEX,
-    IMAGE_TOKEN_INDEX,
-    VIDEO_TOKEN_INDEX,
-    DataCollatorForSupervisedDataset,
-    preprocess_qwen_visual,
-)
-from .rope2d import get_rope_index_3
+from .data_processor import (IGNORE_INDEX, IMAGE_TOKEN_INDEX,
+                             VIDEO_TOKEN_INDEX,
+                             DataCollatorForSupervisedDataset,
+                             preprocess_qwen_visual)
+# Generic VL infrastructure (EXPERIMENTAL - may move to torchtitan/hf_datasets/)
+from .vl_datasets import (VL_DATASETS, HuggingFaceVLDataset,
+                          build_vl_dataloader, format_vqav2_sample)
 
 __all__ = [
     # Generic VL infrastructure (EXPERIMENTAL)
@@ -67,8 +57,6 @@ __all__ = [
     "HuggingFaceVLDataset",
     "build_vl_dataloader",
     "format_vqav2_sample",
-    # 3D RoPE position encoding (Qwen3-VL specific)
-    "get_rope_index_3",
     # Preprocessing (Qwen3-VL specific)
     "preprocess_qwen_visual",
     "DataCollatorForSupervisedDataset",

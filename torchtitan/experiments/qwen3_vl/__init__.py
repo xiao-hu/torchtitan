@@ -31,7 +31,15 @@ __all__ = [
     "Qwen3VLVisionEncoder",
     "SpecialTokens",
     "qwen3_vl_args",
+    "get_train_spec",
 ]
+
+
+def get_train_spec():
+    """Get TrainSpec for Qwen3-VL."""
+    from torchtitan.experiments.qwen3_vl.train_spec import qwen3_vl_train_spec
+    
+    return qwen3_vl_train_spec
 
 # Model configurations for different Qwen3 VL variants
 qwen3_vl_args = {

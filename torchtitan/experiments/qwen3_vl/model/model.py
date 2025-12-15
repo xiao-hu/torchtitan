@@ -369,6 +369,14 @@ class Qwen3VLModel(nn.Module):
     def set_input_embeddings(self, value):
         self.language_model.tok_embeddings = value
     
+    def init_weights(self, buffer_device=None):
+        """
+        Initialize model weights. Delegates to language model's init_weights.
+        Vision encoder weights are typically loaded from pretrained checkpoint.
+        """
+        if hasattr(self.language_model, 'init_weights'):
+            self.language_model.init_weights(buffer_device=buffer_device)
+    
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,

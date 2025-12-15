@@ -1,0 +1,79 @@
+# Qwen3-VL 30B-A3B Training Configuration
+# Optimized for 8x H200 GPUs (141GiB memory each)
+# Vision-Language Model with Mixture of Experts
+
+[job]
+dump_folder = "/checkpoints/xxie-sandbox/titan/output/qwen3-vl-30b/"
+description = "Qwen3-VL 30B-A3B Vision-Language Model training"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 10
+enable_tensorboard = false
+save_tb_folder = "tb"
+
+[model]
+name = "qwen3_vl"  # ← Triggers qwen3_vl_train_spec
+flavor = "30B-A3B"
+hf_assets_path = "/checkpoints/xxie-sandbox/Qwen/Qwen3-VL-30B-A3B-Instruct"
+
+[optimizer]
+name = "AdamW"
+lr = 8e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 600  # 20% of total steps
+
+[training]
+local_batch_size = 2  # Reduced from 4 due to vision encoder memory
+seq_len = 4096  # Context length for vision-language
+max_norm = 1.0  # Gradient clipping
+steps = 1  # Start with 1 step for testing
+dataset = "vqav2"  # Vision-Language dataset from VL_DATASETS registry
+
+# Note: Vision-specific parameters (patch_size, spatial_merge_size, etc.) 
+# are currently handled by the model and processor directly.
+# Sample packing can be added once JobConfig supports it.
+
+[parallelism]
+# Data Parallelism
+data_parallel_replicate_degree = 1  # No DDP replication
+data_parallel_shard_degree = -1  # Auto FSDP: uses remaining ranks after TP/EP
+
+# Model Parallelism
+tensor_parallel_degree = 1  # TP across model layers
+context_parallel_degree = 1  # Sequence parallelism
+
+# Expert Parallelism (MOE-specific)
+expert_parallel_degree = 4  # Partition experts across 4 GPUs
+expert_tensor_parallel_degree = 1  # TP within each expert
+
+# FSDP Configuration
+fsdp_reshard_after_forward = "default"  # Memory-efficient resharding
+
+[checkpoint]
+enable = false
+folder = "checkpoint"
+interval = 500  # Save every 500 steps
+last_save_model_only = false
+export_dtype = "float16"
+async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
+
+[activation_checkpoint]
+mode = "selective"  # Checkpoint select layers to save memory
+selective_ac_option = "op"  # Checkpoint based on operation policy
+
+[compile]
+enable=false  # 10-30% speedup
+components = ["model", "loss"]
+
+# Optional: Float8 quantization for further speedup
+# [quantize.linear.float8]
+# enable_fsdp_float8_all_gather = false
+# precompute_float8_dynamic_scale_for_fsdp = false
+# filter_fqns = ["output"]
