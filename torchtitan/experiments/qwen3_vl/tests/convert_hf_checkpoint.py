@@ -22,22 +22,46 @@ This script:
 """
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
 
 import torch
-from transformers import Qwen3VLForConditionalGeneration
+from transformers import AutoModelForVision2Seq, Qwen3VLProcessor
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-from torchtitan.experiments.qwen3_vl import (
-    Qwen3VLModelArgs,
-    Qwen3VLStateDictAdapter,
-    qwen3_vl_args,
-)
+from torchtitan.experiments.qwen3_vl import (Qwen3VLModel, Qwen3VLModelArgs,
+                                             Qwen3VLStateDictAdapter,
+                                             qwen3_vl_args)
+
+
+def detect_model_flavor(checkpoint_path: str) -> str:
+    """Detect the model flavor from HF checkpoint config."""
+    from transformers import AutoConfig
+    
+    print("Detecting model flavor from checkpoint config...")
+    config = AutoConfig.from_pretrained(checkpoint_path)
+    
+    # Check language model config
+    lang_config = config.text_config
+    n_layers = lang_config.num_hidden_layers
+    hidden_size = lang_config.hidden_size
+    
+    # Map to TorchTitan flavors
+    if n_layers == 48 and hidden_size == 2048:
+        flavor = "30B-A3B"
+    elif n_layers == 8 and hidden_size == 256:
+        flavor = "debugmodel"
+    else:
+        # Unknown config - default to 30B-A3B
+        print(f"  ⚠️ Unknown config: {n_layers} layers, {hidden_size} hidden size")
+        print("  Defaulting to '30B-A3B' flavor")
+        flavor = "30B-A3B"
+    
+    print(f"✓ Detected flavor: {flavor} ({n_layers} layers, {hidden_size} hidden size)")
+    return flavor
 
 
 def load_hf_checkpoint(checkpoint_path: str):
@@ -48,9 +72,9 @@ def load_hf_checkpoint(checkpoint_path: str):
     
     print(f"Loading from: {checkpoint_path}")
     
-    # Load model
+    # Load model using AutoModelForVision2Seq to handle MOE models
     print("Loading model (this may take a while for 30B model)...")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    model = AutoModelForVision2Seq.from_pretrained(
         checkpoint_path,
         torch_dtype=torch.bfloat16,
         # No device_map = loads to CPU by default
@@ -67,7 +91,7 @@ def load_hf_checkpoint(checkpoint_path: str):
     text_keys = [k for k in state_dict.keys() if "language_model" in k]
     moe_keys = [k for k in state_dict.keys() if "mlp.experts" in k or "mlp.gate" in k]
     
-    print(f"\nKey distribution:")
+    print("\nKey distribution:")
     print(f"  Vision keys: {len(vision_keys)}")
     print(f"  Text keys: {len(text_keys)}")
     print(f"  MOE keys: {len(moe_keys)}")
@@ -98,11 +122,11 @@ def convert_to_torchtitan(
     vision_keys = [k for k in tt_state_dict.keys() if k.startswith("visual.")]
     text_keys = [k for k in tt_state_dict.keys() if k.startswith("language_model.")]
     
-    print(f"\nTorchTitan key distribution:")
+    print("\nTorchTitan key distribution:")
     print(f"  Vision keys: {len(vision_keys)}")
     print(f"  Text keys: {len(text_keys)}")
     
-    print(f"\nSample TorchTitan keys:")
+    print("\nSample TorchTitan keys:")
     for i, key in enumerate(list(tt_state_dict.keys())[:10]):
         print(f"  {key}")
     if len(tt_state_dict) > 10:
@@ -165,7 +189,7 @@ def validate_conversion(
     missing_keys = original_keys - reconverted_keys
     extra_keys = reconverted_keys - original_keys
     
-    print(f"\nKey comparison:")
+    print("\nKey comparison:")
     print(f"  Original HF keys: {len(original_keys)}")
     print(f"  Reconverted keys: {len(reconverted_keys)}")
     
@@ -205,6 +229,131 @@ def validate_conversion(
     return len(shape_mismatches) == 0
 
 
+def test_model_inference(
+    tt_state_dict: dict,
+    model_args: Qwen3VLModelArgs,
+    hf_assets_path: str,
+):
+    """Test that the converted model can run inference with a real VQAv2 sample."""
+    print(f"\n{'=' * 80}")
+    print("TESTING MODEL INFERENCE")
+    print(f"{'=' * 80}\n")
+    
+    try:
+        # Check GPU availability
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+        
+        # Create TorchTitan model
+        print("Creating TorchTitan model...")
+        model = Qwen3VLModel(model_args)
+        
+        # Load converted weights
+        print("Loading converted weights...")
+        model.load_state_dict(tt_state_dict)
+        
+        # Move model to device
+        print(f"Moving model to {device}...")
+        model = model.to(device)
+        model.eval()
+        
+        print("✓ Model loaded successfully")
+        print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # Load a real sample using HuggingFaceVLDataset with PIL-aware preprocessing
+        print("\nLoading real VQAv2 sample using HuggingFaceVLDataset...")
+        from torchtitan.experiments.qwen3_vl.datasets import \
+            HuggingFaceVLDataset
+        from torchtitan.experiments.qwen3_vl.train_spec import \
+            preprocess_qwen_visual_pil
+
+        # Load processor
+        processor = Qwen3VLProcessor.from_pretrained(hf_assets_path)
+        
+        # Create dataset with PIL-aware preprocessing (handles PIL Images from VQAv2)
+        vl_dataset = HuggingFaceVLDataset(
+            dataset_name="vqav2",
+            dataset_path="lmms-lab/VQAv2",
+            processor=processor,
+            preprocess_fn=preprocess_qwen_visual_pil,  # PIL-aware version
+            batch_size=1,
+            seq_len=2048,
+            packing_buffer_size=0,  # No packing for test
+            dp_rank=0,
+            dp_world_size=1,
+            infinite=False,
+        )
+        
+        # Get one processed sample
+        processed = next(iter(vl_dataset))
+        
+        print("  Loaded sample from VQAv2 using dataset pipeline")
+        
+        # Extract tensors (already preprocessed by HuggingFaceVLDataset)
+        input_ids = processed["input_ids"]
+        pixel_values = processed["pixel_values"]
+        image_grid_thw = processed["image_grid_thw"]
+        
+        print(f"  input_ids shape: {input_ids.shape}, dtype: {input_ids.dtype}")
+        print(f"  pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+        print(f"  image_grid_thw shape: {image_grid_thw.shape}, dtype: {image_grid_thw.dtype}")
+        
+        # Move data to device
+        print(f"\nMoving data to {device}...")
+        input_ids = input_ids.to(device)
+        pixel_values = pixel_values.to(device)
+        image_grid_thw = image_grid_thw.to(device)
+        
+        # Run forward pass
+        print("\nRunning forward pass...")
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        
+        # Check outputs
+        print("✓ Forward pass successful!")
+        print(f"  Output shape: {outputs.shape}")
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+        print(f"  Expected: ({batch_size}, {seq_len}, {model_args.vocab_size})")
+        
+        # Verify output shape
+        expected_shape = (batch_size, seq_len, model_args.vocab_size)
+        if outputs.shape == expected_shape:
+            print("✓ Output shape matches expected shape!")
+        else:
+            print("❌ Output shape mismatch!")
+            print(f"  Expected: {expected_shape}")
+            print(f"  Got: {outputs.shape}")
+            return False
+        
+        # Check for NaN or Inf
+        if torch.isnan(outputs).any():
+            print("❌ Output contains NaN values!")
+            return False
+        if torch.isinf(outputs).any():
+            print("❌ Output contains Inf values!")
+            return False
+        
+        print("✓ Output values are valid (no NaN/Inf)")
+        
+        print("\n" + "=" * 80)
+        print("✅ INFERENCE TEST PASSED WITH REAL DATA!")
+        print("=" * 80)
+        
+        return True
+        
+    except Exception as e:
+        print("\n❌ Inference test failed!")
+        print(f"Error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert HF Qwen3-VL checkpoint to TorchTitan format"
@@ -224,9 +373,9 @@ def main():
     parser.add_argument(
         "--model-flavor",
         type=str,
-        default="30B-A3B",
+        default=None,
         choices=["debugmodel", "30B-A3B"],
-        help="Model flavor to use for args",
+        help="Model flavor to use for args (default: auto-detect from checkpoint)",
     )
     parser.add_argument(
         "--validate",
@@ -246,13 +395,21 @@ def main():
     print(f"{'=' * 80}\n")
     print(f"HF Checkpoint: {args.hf_checkpoint}")
     print(f"Output Path: {args.output_path}")
-    print(f"Model Flavor: {args.model_flavor}")
     print(f"Validate: {args.validate}")
     
-    # Get model args
-    model_args = qwen3_vl_args[args.model_flavor]
+    # Auto-detect model flavor if not specified
+    if args.model_flavor is None:
+        print("\nAuto-detecting model flavor...")
+        model_flavor = detect_model_flavor(args.hf_checkpoint)
+    else:
+        model_flavor = args.model_flavor
+        print(f"\nUsing specified model flavor: {model_flavor}")
     
-    print(f"\nModel configuration:")
+    # Get model args
+    model_args = qwen3_vl_args[model_flavor]
+    
+    print(f"\nUsing TorchTitan model flavor: {model_flavor}")
+    print("Model configuration:")
     print(f"  Layers: {model_args.n_layers}")
     print(f"  Hidden size: {model_args.dim}")
     print(f"  Heads: {model_args.n_heads}")
@@ -272,8 +429,25 @@ def main():
         args.hf_checkpoint,
     )
     
+    # Test model inference (always run this)
+    print("\n" + "=" * 80)
+    print("STEP 1: Testing model inference with converted weights")
+    print("=" * 80)
+    inference_ok = test_model_inference(
+        tt_state_dict,
+        model_args,
+        args.hf_checkpoint,
+    )
+    
+    if not inference_ok:
+        print("\n❌ Inference test failed! Model forward pass has issues.")
+        return 1
+    
     # Validate if requested
     if args.validate:
+        print("\n" + "=" * 80)
+        print("STEP 2: Validating conversion (optional)")
+        print("=" * 80)
         valid = validate_conversion(
             hf_state_dict,
             tt_state_dict,
@@ -295,10 +469,10 @@ def main():
     print(f"{'=' * 80}\n")
     
     print("Next steps:")
-    print(f"  1. Load checkpoint in TorchTitan:")
+    print("  1. Load checkpoint in TorchTitan:")
     print(f"     checkpoint = torch.load('{args.output_path}')")
-    print(f"     model.load_state_dict(checkpoint['model'])")
-    print(f"  2. Start training with TorchTitan")
+    print("     model.load_state_dict(checkpoint['model'])")
+    print("  2. Start training with TorchTitan")
     
     return 0
 

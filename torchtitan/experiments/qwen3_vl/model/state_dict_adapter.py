@@ -123,8 +123,11 @@ class Qwen3VLStateDictAdapter(Qwen3StateDictAdapter):
         
         Handles:
         1. Vision encoder keys (strip model. prefix)
-        2. Text model keys (strip model.language_model., use parent logic, add language_model. prefix)
-        3. MOE expert weights (handled by parent)
+        2. Text model keys (strip model.language_model., convert GroupedExperts directly, use parent for non-MOE)
+        3. GroupedExperts weights (convert directly without splitting - both HF and TorchTitan use GroupedExperts)
+        
+        Note: Qwen3-VL-MOE HF checkpoint uses GroupedExperts format where all experts are in a single tensor.
+        TorchTitan also uses GroupedExperts, so we directly convert keys without splitting/concatenating.
         
         Args:
             hf_state_dict: HuggingFace model state dict
@@ -132,31 +135,68 @@ class Qwen3VLStateDictAdapter(Qwen3StateDictAdapter):
         Returns:
             TorchTitan-formatted state dict
         """
-        # Separate vision and text model keys
+        import torch
+
+        # Separate vision, text, and grouped expert keys
         vision_dict = {}
         text_dict = {}
+        grouped_dict = {}  # GroupedExperts keys - direct conversion, bypass parent
         
+        # HF Qwen3-VL-MOE uses GroupedExperts format - convert directly to TorchTitan format
         for key, value in hf_state_dict.items():
             if key.startswith("model.visual."):
                 # Vision encoder: strip model. prefix
                 tt_key = key.replace("model.", "", 1)
                 vision_dict[tt_key] = value
+                
             elif key.startswith("model.language_model."):
-                # Text model keys: strip model.language_model. -> model. for parent
-                # Parent expects model.* format
-                parent_key = key.replace("model.language_model.", "model.", 1)
-                text_dict[parent_key] = value
+                # Check if this is a GroupedExperts key - convert directly
+                if ".mlp.experts.down_proj" in key:
+                    # GroupedExperts down_proj [num_experts, intermediate, hidden] → w2 [num_experts, hidden, intermediate]
+                    # Transpose last 2 dims: [128, 768, 2048] → [128, 2048, 768]
+                    tt_key = key.replace("model.language_model.", "").replace(".mlp.experts.down_proj", ".moe.experts.w2")
+                    grouped_dict[tt_key] = value.transpose(-2, -1)
+                    
+                elif ".mlp.experts.gate_up_proj" in key:
+                    # GroupedExperts fused gate_up_proj [num_experts, hidden, 2*intermediate]
+                    # Split into w1 and w3, transpose to [num_experts, intermediate, hidden]
+                    w1, w3 = value.chunk(2, dim=-1)  # Split: [128, 2048, 1536] → 2x [128, 2048, 768]
+                    # Transpose last 2 dims: [128, 2048, 768] → [128, 768, 2048]
+                    base_key = key.replace("model.language_model.", "").replace(".mlp.experts.gate_up_proj", ".moe.experts")
+                    grouped_dict[f"{base_key}.w1"] = w1.transpose(-2, -1)  # gate_proj → w1
+                    grouped_dict[f"{base_key}.w3"] = w3.transpose(-2, -1)  # up_proj → w3
+                    
+                    # Add expert_bias (not in HF checkpoint, initialize with zeros)
+                    # Shape: [num_experts] - one bias value per expert for load balancing
+                    num_experts = w1.shape[0]
+                    expert_bias_key = base_key.replace(".moe.experts", ".moe.expert_bias")
+                    grouped_dict[expert_bias_key] = torch.zeros(num_experts, dtype=value.dtype, device=value.device)
+                    
+                elif ".mlp.gate.weight" in key:
+                    # Router gate - direct conversion
+                    # model.language_model.layers.N.mlp.gate.weight → layers.N.moe.router.gate.weight
+                    tt_key = key.replace("model.language_model.", "").replace(".mlp.gate.weight", ".moe.router.gate.weight")
+                    grouped_dict[tt_key] = value
+                    
+                else:
+                    # Non-GroupedExperts text model keys: strip model.language_model. → model. for parent
+                    parent_key = key.replace("model.language_model.", "model.", 1)
+                    text_dict[parent_key] = value
             else:
                 # Other keys (like lm_head.weight) pass through to parent
                 text_dict[key] = value
         
-        # Convert text model using parent logic
+        # Convert non-GroupedExperts text model using parent logic
         tt_text_dict = super().from_hf(text_dict)
         
-        # Add language_model. prefix to ALL text model keys
+        # Add language_model. prefix to all text model keys (both parent-converted and GroupedExperts)
         prefixed_text_dict = {}
         for key, value in tt_text_dict.items():
-            # Add prefix to all keys (layers, embeddings, etc.)
+            prefixed_key = f"language_model.{key}"
+            prefixed_text_dict[prefixed_key] = value
+        
+        # Add language_model. prefix to GroupedExperts keys
+        for key, value in grouped_dict.items():
             prefixed_key = f"language_model.{key}"
             prefixed_text_dict[prefixed_key] = value
         

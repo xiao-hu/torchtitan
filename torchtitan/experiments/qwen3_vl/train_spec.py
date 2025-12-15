@@ -23,13 +23,138 @@ from torchtitan.components.validate import build_validator
 from torchtitan.config import JobConfig
 from torchtitan.experiments.qwen3_vl import Qwen3VLModel, qwen3_vl_args
 from torchtitan.experiments.qwen3_vl.datasets import (
-    DataCollatorForSupervisedDataset, build_vl_dataloader,
-    preprocess_qwen_visual)
+    DataCollatorForSupervisedDataset, build_vl_dataloader)
 from torchtitan.experiments.qwen3_vl.infra.parallelize import \
     parallelize_qwen3_vl
+from torchtitan.experiments.qwen3_vl.model.model import get_rope_index
 from torchtitan.experiments.qwen3_vl.model.state_dict_adapter import \
     Qwen3VLStateDictAdapter
 from torchtitan.protocols.train_spec import TrainSpec
+
+
+def preprocess_qwen_visual_pil(sources, processor):
+    """
+    PIL-aware preprocessing for Qwen3-VL models.
+    
+    This is an alternative to preprocess_qwen_visual from data_processor.py that
+    handles PIL Images directly instead of requiring file paths. Use this for datasets
+    like VQAv2 that provide PIL Images in memory.
+    
+    Args:
+        sources: List of formatted samples with PIL Images in 'image' field
+        processor: Qwen3VLProcessor instance
+        
+    Returns:
+        Dict with input_ids, pixel_values, image_grid_thw, and labels
+    """
+    import torch
+    
+    IGNORE_INDEX = -100
+    
+    if len(sources) != 1:
+        raise ValueError(f"Expected 1 source, got {len(sources)}")
+    
+    source = sources[0]
+    
+    # Extract PIL images
+    pil_images = source.get("image", [])
+    if not isinstance(pil_images, list):
+        pil_images = [pil_images]
+    
+    # Build messages for processor (using PIL Images directly)
+    conversations = source.get("conversations", [])
+    messages = []
+    
+    for turn in conversations:
+        role = "user" if turn["from"] == "human" else "assistant"
+        text = turn["value"]
+        
+        if role == "user":
+            # Build content with PIL images
+            content = []
+            
+            # Handle <image> placeholders in text
+            text_parts = text.split("<image>")
+            
+            image_idx = 0
+            for i, part in enumerate(text_parts):
+                if i > 0 and image_idx < len(pil_images):
+                    # Insert image before this text part
+                    content.append({"type": "image", "image": pil_images[image_idx]})
+                    image_idx += 1
+                
+                if part.strip():
+                    content.append({"type": "text", "text": part.strip()})
+            
+            messages.append({"role": role, "content": content})
+        else:
+            # Assistant messages contain only text
+            messages.append({"role": role, "content": text})
+    
+    # Use processor to handle PIL images
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    full_result = processor(
+        text=[text],
+        images=pil_images if pil_images else None,
+        return_tensors="pt",
+    )
+    
+    # Ensure correct dtypes and shapes
+    input_ids = full_result["input_ids"].long()  # Must be Long for embedding
+    if isinstance(input_ids, list):
+        input_ids = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+    
+    # Ensure pixel_values has correct shape (add batch dim if missing)
+    if "pixel_values" in full_result and full_result["pixel_values"] is not None:
+        pixel_values = full_result["pixel_values"]
+        if pixel_values.dim() == 2:
+            # Missing batch dim - add it
+            pixel_values = pixel_values.unsqueeze(0)
+        full_result["pixel_values"] = pixel_values
+    
+    # Ensure image_grid_thw has correct dtype
+    if "image_grid_thw" in full_result and full_result["image_grid_thw"] is not None:
+        full_result["image_grid_thw"] = full_result["image_grid_thw"].long()
+    
+    # Create labels (mask everything except assistant responses)
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    
+    # Find assistant response tokens (between <|im_start|>assistant and <|im_end|>)
+    input_ids_flat = input_ids[0].tolist()
+    L = len(input_ids_flat)
+    pos = 0
+    while pos < L:
+        # Token 77091 is <|im_start|> 
+        if input_ids_flat[pos] == 77091:
+            # Check if next token indicates assistant turn
+            ans_start = pos + 2
+            ans_end = ans_start
+            # Token 151645 is <|im_end|>
+            while ans_end < L and input_ids_flat[ans_end] != 151645:
+                ans_end += 1
+            if ans_end < L:
+                labels[0, ans_start : ans_end + 2] = input_ids[0, ans_start : ans_end + 2]
+                pos = ans_end
+        pos += 1
+    
+    full_result["labels"] = labels
+    full_result["input_ids"] = input_ids
+    
+    # Calculate position_ids for 3D RoPE (required by collator)
+    # This is done during data loading for efficiency (computed once, reused across epochs)
+    position_ids, _ = get_rope_index(
+        input_ids=input_ids,
+        image_grid_thw=full_result.get("image_grid_thw"),
+        video_grid_thw=full_result.get("video_grid_thw"),
+        attention_mask=None,  # Will be computed from input_ids
+        spatial_merge_size=2,  # Default from model config
+        image_token_id=151655,
+        video_token_id=151656,
+        vision_start_token_id=151652,
+    )
+    full_result["position_ids"] = position_ids
+    
+    return full_result
 
 
 def build_qwen3vl_tokenizer(job_config: JobConfig):
@@ -81,17 +206,31 @@ def build_qwen3vl_dataloader(
         ParallelAwareDataloader with VL-specific components
     """
 
-    # Create collator with just the tokenizer component
-    collator = DataCollatorForSupervisedDataset(
+    # Create base collator
+    base_collator = DataCollatorForSupervisedDataset(
         tokenizer=tokenizer.tokenizer
     )
+    
+    # Wrap collator to match TorchTitan's expected format: (input_dict, labels)
+    def collator(instances):
+        """
+        Wrapper that adapts Qwen3-VL collator output to TorchTitan format.
+        
+        Qwen3-VL collator returns: dict with labels inside
+        TorchTitan expects: tuple of (input_dict, labels)
+        """
+        batch = base_collator(instances)
+        # Extract labels and rename input_ids to input
+        labels = batch.pop("labels")
+        batch["input"] = batch.pop("input_ids")
+        return batch, labels
     
     # Build dataloader with model-specific preprocessing
     return build_vl_dataloader(
         dp_world_size=dp_world_size,
         dp_rank=dp_rank,
         processor=tokenizer,
-        preprocess_fn=preprocess_qwen_visual,
+        preprocess_fn=preprocess_qwen_visual_pil,
         collate_fn=collator,
         job_config=job_config,
         infinite=True,  # Loop dataset infinitely for training

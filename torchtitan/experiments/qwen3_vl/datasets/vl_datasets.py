@@ -46,7 +46,10 @@ def format_vqav2_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
         {
             "image": PIL.Image,
             "question": str,
-            "answers": {"answer": [str, str, ...], ...},
+            "answers": [
+                {"answer": str, "answer_confidence": str, "answer_id": int},
+                ...
+            ],
             ...
         }
     
@@ -61,8 +64,13 @@ def format_vqav2_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
         }
     """
     # Get the most common answer (VQAv2 has multiple annotations)
-    answers = sample.get("answers", {}).get("answer", [])
-    answer = answers[0] if answers else "unknown"
+    # answers is a list of dicts: [{"answer": str, "answer_confidence": str, "answer_id": int}, ...]
+    answers_list = sample.get("answers", [])
+    if answers_list and isinstance(answers_list, list):
+        # Extract the "answer" field from the first annotation
+        answer = answers_list[0].get("answer", "unknown") if isinstance(answers_list[0], dict) else "unknown"
+    else:
+        answer = "unknown"
     
     # Format question with image placeholder
     question = sample["question"]

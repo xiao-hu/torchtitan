@@ -20,10 +20,74 @@ from typing import Optional
 import torch
 from torch import nn
 
-from torchtitan.models.qwen3.model.model import Qwen3Model
+from torchtitan.models.qwen3.model.model import Qwen3Model, apply_rotary_emb as qwen3_apply_rotary_emb
 
 from .args import Qwen3VLModelArgs
 from .vision import Qwen3VLVisionEncoder
+
+
+def apply_rotary_emb_mrope(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    rope_cache: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply multi-resolution RoPE for Qwen3-VL (handles 3D positions).
+    
+    For Qwen3-VL:
+    - positions shape: (3, bz, seqlen) for T, H, W dimensions  
+    - Each dimension uses 1/3 of head_dim for RoPE
+    
+    For regular text-only:
+    - positions shape: (bz, seqlen)
+    - Falls back to standard RoPE
+    """
+    # Check if we have 3D positions (Qwen3-VL mode)
+    if positions is not None and positions.dim() == 3:
+        # Multi-resolution RoPE for vision + text
+        assert positions.shape[0] == 3, f"Expected 3 dimensions for MroPE, got {positions.shape[0]}"
+        
+        bz, seqlen, n_heads, head_dim = xq.shape
+        
+        # Split head_dim into 3 parts for T, H, W
+        part_dim = head_dim // 3
+        
+        xq_out = torch.empty_like(xq)
+        xk_out = torch.empty_like(xk)
+        
+        # Apply RoPE to each dimension separately
+        for dim_idx in range(3):
+            # Get positions for this dimension: (bz, seqlen)
+            dim_positions = positions[dim_idx]
+            
+            # Get the corresponding slice of head_dim and rope_cache
+            start_idx = dim_idx * part_dim
+            end_idx = start_idx + part_dim if dim_idx < 2 else head_dim  # Last part gets remainder
+            actual_part_dim = end_idx - start_idx
+            
+            xq_part = xq[..., start_idx:end_idx]
+            xk_part = xk[..., start_idx:end_idx]
+            
+            # Slice rope_cache to match this part's dimension
+            # rope_cache shape: (max_seq_len, head_dim * 2)
+            # We need: (max_seq_len, actual_part_dim * 2)
+            rope_start = start_idx * 2  # *2 because cache has both cos and sin
+            rope_end = rope_start + actual_part_dim * 2
+            rope_cache_part = rope_cache[:, rope_start:rope_end]
+            
+            # Apply standard RoPE to this part
+            xq_part, xk_part = qwen3_apply_rotary_emb(
+                xq_part, xk_part, rope_cache_part, dim_positions
+            )
+            
+            xq_out[..., start_idx:end_idx] = xq_part
+            xk_out[..., start_idx:end_idx] = xk_part
+        
+        return xq_out, xk_out
+    else:
+        # Standard RoPE for text-only
+        return qwen3_apply_rotary_emb(xq, xk, rope_cache, positions)
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -241,6 +305,7 @@ class Qwen3VLTextModel(Qwen3Model):
     Inherits all Qwen3Model functionality and adds:
     - _deepstack_process(): Injects visual features at specific positions
     - Modified forward(): Accepts visual_pos_masks and deepstack_visual_embeds
+    - Uses multi-resolution RoPE (MroPE) for 3D positional encoding
     
     This matches HF's Qwen3VLTextModel which extends Qwen3Model.
     HF Reference: Lines ~650-750 in modular_qwen3_vl.py
@@ -249,6 +314,17 @@ class Qwen3VLTextModel(Qwen3Model):
     def __init__(self, model_args: Qwen3VLModelArgs):
         # Initialize parent Qwen3Model
         super().__init__(model_args)
+        
+        # Patch all attention layers to use MroPE instead of standard RoPE
+        self._patch_attention_layers()
+    
+    def _patch_attention_layers(self):
+        """Patch attention layers to use apply_rotary_emb_mrope instead of apply_rotary_emb."""
+        from torchtitan.models.qwen3.model import model as qwen3_model_module
+        
+        # Temporarily replace the apply_rotary_emb function in the qwen3 module
+        # This way, all attention layers will use MroPE
+        qwen3_model_module.apply_rotary_emb = apply_rotary_emb_mrope
     
     def _deepstack_process(
         self,
@@ -312,9 +388,10 @@ class Qwen3VLTextModel(Qwen3Model):
             
         HF Reference: Lines ~810-870 in modular_qwen3_vl.py
         """
-        # Step 1: Get embeddings (either from tokens or passed directly)
-        # In VL case, tokens will be None and we'll use the embeddings passed as tokens param
-        h = self.tok_embeddings(tokens) if self.tok_embeddings and tokens is not None else tokens
+        # Step 1: Get embeddings
+        # In VL mode, tokens are already embeddings (from Qwen3VLModel.forward)
+        # In text-only mode, tokens would be IDs but VL always provides embeddings
+        h = tokens
         
         # Step 2: Process through layers with DeepStack injection
         for layer_idx, layer in enumerate(self.layers.values()):
@@ -536,10 +613,11 @@ class Qwen3VLModel(nn.Module):
             self.rope_deltas = rope_deltas
         
         # Step 5: Forward through Qwen3VLTextModel with DeepStack
+        # NOTE: Qwen3 doesn't support attention_masks, it uses causal masking internally
         outputs = self.language_model(
             tokens=inputs_embeds,  # Pass embeddings directly (not token IDs)
             rope_cache=self.language_model.rope_cache,
-            attention_masks=attention_mask,
+            attention_masks=None,  # Qwen3 uses causal masking, doesn't accept external masks
             positions=position_ids,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
