@@ -113,6 +113,7 @@ def preprocess_qwen_visual_pil(sources, processor):
         full_result["pixel_values"] = pixel_values
     
     # Ensure image_grid_thw has correct dtype
+    # Processor always returns [num_images, 3] for image_grid_thw
     if "image_grid_thw" in full_result and full_result["image_grid_thw"] is not None:
         full_result["image_grid_thw"] = full_result["image_grid_thw"].long()
     
@@ -120,20 +121,29 @@ def preprocess_qwen_visual_pil(sources, processor):
     labels = torch.full_like(input_ids, IGNORE_INDEX)
     
     # Find assistant response tokens (between <|im_start|>assistant and <|im_end|>)
+    # Token IDs: <|im_start|>=151644, user=872, assistant=77091, <|im_end|>=151645, \n=198
     input_ids_flat = input_ids[0].tolist()
     L = len(input_ids_flat)
     pos = 0
-    while pos < L:
-        # Token 77091 is <|im_start|> 
-        if input_ids_flat[pos] == 77091:
-            # Check if next token indicates assistant turn
-            ans_start = pos + 2
+    while pos < L - 1:
+        # Look for <|im_start|> followed by assistant
+        if input_ids_flat[pos] == 151644 and input_ids_flat[pos + 1] == 77091:
+            # Found assistant turn
+            # The chat template adds '\n' after '<|im_start|>assistant' as part of generation prompt
+            # So we should unmask from AFTER the newline (what model actually generates)
+            ans_start = pos + 2  # Skip <|im_start|> and "assistant"
+            
+            # Skip the newline if present (it's part of the template prompt, not model output)
+            if ans_start < L and input_ids_flat[ans_start] == 198:  # 198 is '\n'
+                ans_start += 1
+            
             ans_end = ans_start
-            # Token 151645 is <|im_end|>
+            # Find the closing <|im_end|>
             while ans_end < L and input_ids_flat[ans_end] != 151645:
                 ans_end += 1
             if ans_end < L:
-                labels[0, ans_start : ans_end + 2] = input_ids[0, ans_start : ans_end + 2]
+                # Unmask assistant response including <|im_end|>
+                labels[0, ans_start : ans_end + 1] = input_ids[0, ans_start : ans_end + 1]
                 pos = ans_end
         pos += 1
     
@@ -144,7 +154,7 @@ def preprocess_qwen_visual_pil(sources, processor):
     # This is done during data loading for efficiency (computed once, reused across epochs)
     position_ids, _ = get_rope_index(
         input_ids=input_ids,
-        image_grid_thw=full_result.get("image_grid_thw"),
+        image_grid_thw=full_result.get("image_grid_thw"),  # Already normalized above
         video_grid_thw=full_result.get("video_grid_thw"),
         attention_mask=None,  # Will be computed from input_ids
         spatial_merge_size=2,  # Default from model config

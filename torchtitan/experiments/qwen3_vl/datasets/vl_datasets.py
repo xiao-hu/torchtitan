@@ -21,7 +21,7 @@ from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.config import JobConfig
-from torchtitan.experiments.vlm.datasets.utils.packing import SamplePacker
+from torchtitan.experiments.qwen3_vl.datasets.packing import VLSamplePacker
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
@@ -136,26 +136,20 @@ def _validate_vl_dataset(
 
 class HuggingFaceVLDataset(IterableDataset, Stateful):
     """
-    Generic Vision-Language dataset for HuggingFace datasets with optional sample packing.
+    HuggingFace Vision-Language Dataset with optional sample packing.
     
-    Uses a sample_processor to convert dataset-specific formats to
-    the model's expected format (e.g., Qwen3-VL conversation format).
-    
-    Features:
-        - Clean separation: dataset formatting vs model preprocessing
-        - Optional sample packing for training efficiency
-        - Streaming and non-streaming dataset support
-        - Stateful checkpointing with packer state
-        - Robust error handling
+    Follows the same pattern as mm_datasets.py for proven reliability.
+    Sample-based packing maintains strict sample boundaries and works
+    with models that don't support external attention masks.
     
     Args:
         dataset_name: Name of dataset from VL_DATASETS registry
         dataset_path: Optional override path
         processor: Vision-language processor (tokenizer + image processor)
-        preprocess_fn: Function to preprocess samples (e.g., preprocess_qwen_visual)
+        preprocess_fn: Function to preprocess samples
         batch_size: Batch size for sample packing
-        seq_len: Maximum sequence length for packing
-        packing_buffer_size: Size of packing buffer (0 = disabled)
+        seq_len: Maximum sequence length
+        packing_buffer_size: Buffer size for packing (0=disabled)
         dp_rank: Data parallel rank
         dp_world_size: Data parallel world size
         infinite: Whether to loop dataset infinitely
@@ -165,8 +159,8 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
         self,
         dataset_name: str,
         dataset_path: str | None,
-        processor: Any,  # Qwen3VLProcessor or similar
-        preprocess_fn: Callable,  # e.g., preprocess_qwen_visual
+        processor: Any,
+        preprocess_fn: Callable,
         batch_size: int = 1,
         seq_len: int = 2048,
         packing_buffer_size: int = 0,
@@ -190,14 +184,15 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.infinite = infinite
-
-        # Optional sample packing for efficiency
         self.enable_packing = packing_buffer_size > 0
+        
         if self.enable_packing:
-            self.packer = SamplePacker(
+            self.packer = VLSamplePacker(
                 max_seq_length=seq_len,
                 buffer_size=packing_buffer_size,
                 batch_size=batch_size,
+                pad_token_id=151643,  # Qwen3 pad token
+                ignore_index=-100,
             )
             logger.info(
                 f"Sample packing enabled: buffer_size={packing_buffer_size}, "
@@ -206,18 +201,20 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
 
         # Variables for checkpointing
         self._sample_idx = 0
+        self.error_count = 0
 
     def __iter__(self):
         while True:
             for sample in self._get_data_iter():
                 try:
-                    # Step 1: Use dataset-specific processor to convert to standard format
-                    formatted_sample = self._sample_processor(sample)
+                    self._sample_idx += 1
                     
-                    # Step 2: Use model-specific preprocessing (tokenization, image processing, etc.)
+                    # Format and preprocess sample
+                    formatted_sample = self._sample_processor(sample)
                     processed = self._preprocess_fn([formatted_sample], self._processor)
                     
-                    self._sample_idx += 1
+                    if processed is None:
+                        continue
 
                     # Check sequence length
                     if processed["input_ids"].shape[0] > self.seq_len:
@@ -227,7 +224,6 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
                         )
                         continue
 
-                    # Step 3: Optional packing or direct yield
                     if self.enable_packing:
                         self.packer.add_sample(processed)
                         
@@ -236,10 +232,27 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
                             if batch:
                                 yield from batch
                     else:
-                        yield processed
+                        yield processed  # individual sample
 
                 except Exception as e:
-                    logger.warning(f"Error processing sample: {e}")
+                    error_msg = str(e)
+                    # Critical errors that should stop execution immediately
+                    critical_errors = [
+                        "Tensors must have same number of dimensions",
+                        "shape mismatch",
+                        "dimension mismatch",
+                    ]
+                    
+                    if any(critical in error_msg for critical in critical_errors):
+                        logger.error(f"CRITICAL ERROR in packing/processing: {e}")
+                        raise  # Re-raise critical errors
+                    
+                    # Only swallow minor preprocessing errors
+                    logger.warning(f"Error processing VL sample: {e}")
+                    self.error_count += 1
+                    if self.error_count > 10:
+                        logger.error("Too many errors. Stopping.")
+                        raise
                     continue
 
             # Flush remaining packed samples at end of epoch
@@ -255,7 +268,6 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
                 logger.info(f"VL dataset {self.dataset_name} epoch complete")
                 break
             else:
-                # Reset for next iteration
                 self._sample_idx = 0
                 logger.info(f"VL dataset {self.dataset_name} restarting epoch")
 
@@ -282,7 +294,7 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
             return iter([])
 
     def load_state_dict(self, state_dict):
-        """Load dataset state including packer state."""
+        """Load dataset state."""
         self._sample_idx = state_dict["sample_idx"]
 
         # Restore packer state if available
@@ -296,10 +308,9 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
             self.packer.packed_samples.clear()
             self.packer.sample_buffer.extend(packer_state["sample_buffer"])
             self.packer.packed_samples.extend(packer_state["packed_samples"])
-            logger.info(f"Restored packer state: {len(packer_state['sample_buffer'])} buffered samples")
 
     def state_dict(self):
-        """Save dataset state including packer state."""
+        """Save dataset state."""
         state = {"sample_idx": self._sample_idx}
 
         # Save packer state if packing is enabled
@@ -328,11 +339,13 @@ def build_vl_dataloader(
     """
     Build a data loader for Vision-Language datasets with optional sample packing.
     
+    Follows the proven pattern from mm_datasets.py.
+    
     Args:
         dp_world_size: Data parallel world size
         dp_rank: Data parallel rank
         processor: Vision-language processor (e.g., Qwen3VLProcessor)
-        preprocess_fn: Function to preprocess samples (e.g., preprocess_qwen_visual)
+        preprocess_fn: Function to preprocess samples
         collate_fn: Collator for batching (e.g., DataCollatorForSupervisedDataset)
         job_config: TorchTitan job configuration
         infinite: Whether to loop dataset infinitely
@@ -341,10 +354,9 @@ def build_vl_dataloader(
         ParallelAwareDataloader instance
         
     Sample Packing:
-        Enable via job_config.data.packing_buffer_size > 0
-        - Improves GPU utilization by reducing padding
-        - 30-50% training speedup typical
+        - Enable via packing_buffer_size > 0 in config
         - Maintains sample boundaries for correct gradient computation
+        - Works with models that don't support external attention masks
         
     Example:
         >>> from transformers import Qwen3VLProcessor
@@ -370,9 +382,14 @@ def build_vl_dataloader(
     batch_size = job_config.training.local_batch_size
     seq_len = job_config.training.seq_len
 
-    # Get packing configuration (default: disabled)
-    # Since JobConfig doesn't have a data attribute, we default to 0 (disabled)
-    packing_buffer_size = 0
+    # Derive packing buffer size from seq_len
+    # Logic: Assuming average VQA sample is ~400 tokens (question + answer + vision tokens)
+    # - seq_len / 400 ≈ number of samples that fit in one packed sequence
+    # - We want to buffer 10x that to get good packing efficiency
+    # - So: buffer_size = 10 * (seq_len / 400) = seq_len / 40
+    # Example: seq_len=4096 → buffer_size ≈ 102 samples
+    packing_buffer_size = max(50, seq_len // 40)
+    logger.info(f"Packing enabled with buffer_size={packing_buffer_size} (derived from seq_len={seq_len})")
 
     hf_vl_ds = HuggingFaceVLDataset(
         dataset_name=dataset_name,

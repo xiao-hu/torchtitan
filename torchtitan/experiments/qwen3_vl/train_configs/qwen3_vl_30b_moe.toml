@@ -12,7 +12,7 @@ save_traces_folder = "profile_trace"
 profile_freq = 100
 
 [metrics]
-log_freq = 10
+log_freq = 1
 enable_tensorboard = false
 save_tb_folder = "tb"
 
@@ -30,15 +30,15 @@ eps = 1e-8
 warmup_steps = 600  # 20% of total steps
 
 [training]
-local_batch_size = 2  # Reduced from 4 due to vision encoder memory
-seq_len = 4096  # Context length for vision-language
+local_batch_size = 1  # Set to 1: Qwen3-VL collator requires same-sized images per batch
+seq_len = 8192  # Context length for vision-language
 max_norm = 1.0  # Gradient clipping
-steps = 1  # Start with 1 step for testing
+steps = 2  # Start with 2 steps for testing
 dataset = "vqav2"  # Vision-Language dataset from VL_DATASETS registry
 
-# Note: Vision-specific parameters (patch_size, spatial_merge_size, etc.) 
-# are currently handled by the model and processor directly.
-# Sample packing can be added once JobConfig supports it.
+# Note: Sample packing is automatically enabled with buffer_size derived from seq_len
+# Formula: buffer_size = max(50, seq_len // 40) 
+# For seq_len=4096, this gives buffer_size ≈ 102 samples
 
 [parallelism]
 # Data Parallelism
