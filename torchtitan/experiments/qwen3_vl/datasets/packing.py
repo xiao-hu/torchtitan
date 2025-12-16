@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional
 import torch
 
 
-
 class VLSamplePacker:
     """
     Packs multiple VL samples together with proper padding.

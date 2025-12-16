@@ -11,9 +11,12 @@ Follows the same pattern as text_datasets.py with DatasetConfig,
 but for multimodal (vision + text) data.
 """
 
+import json
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict
 
+import torch
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
@@ -324,6 +327,94 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
 
 
 # ============================================================================
+# Preprocessed Dataset Class
+# ============================================================================
+
+class PreprocessedVLDataset(IterableDataset, Stateful):
+    """
+    Load preprocessed and packed VL samples from cache.
+    
+    Uses chunked format with lazy loading to avoid OOM.
+    
+    Much faster than HuggingFaceVLDataset since:
+    - No PIL decoding
+    - No tokenization
+    - No online packing
+    - Just direct tensor loading
+    """
+    
+    def __init__(
+        self,
+        cache_dir: str,
+        dp_rank: int = 0,
+        dp_world_size: int = 1,
+        infinite: bool = False,
+    ):
+        cache_path = Path(cache_dir)
+        
+        # Load metadata
+        with open(cache_path / "metadata.json") as f:
+            self.metadata = json.load(f)
+        
+        self.cache_dir = cache_path
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        self.infinite = infinite
+        
+        # Load chunked format
+        self.chunk_files = [cache_path / name for name in self.metadata["chunk_files"]]
+        self.num_samples = self.metadata["num_packed_samples"]
+        chunk_sizes = self.metadata["chunk_sizes"]
+        logger.info(f"Using chunked cache: {len(self.chunk_files)} chunks, {self.num_samples} total samples")
+        
+        # Build chunk index from metadata (fast - no loading needed!)
+        self.chunk_ranges = []
+        start_idx = 0
+        for chunk_file, chunk_size in zip(self.chunk_files, chunk_sizes):
+            self.chunk_ranges.append((start_idx, start_idx + chunk_size, chunk_file))
+            start_idx += chunk_size
+        
+        # Compute this rank's sample indices
+        self.rank_sample_indices = list(range(dp_rank, self.num_samples, dp_world_size))
+        logger.info(f"Rank {dp_rank}/{dp_world_size} has {len(self.rank_sample_indices)} samples")
+        
+        # State for checkpointing
+        self._sample_idx = 0
+    
+    def _get_sample_from_chunks(self, global_idx: int):
+        """Load a specific sample from chunked storage."""
+        # Find which chunk contains this sample
+        for start, end, chunk_file in self.chunk_ranges:
+            if start <= global_idx < end:
+                # Load chunk and extract sample (pure tensors, safe with weights_only=True)
+                chunk = torch.load(chunk_file, weights_only=True)
+                local_idx = global_idx - start
+                return chunk[local_idx]
+        raise IndexError(f"Sample index {global_idx} out of range")
+    
+    def __iter__(self):
+        while True:
+            # Load samples on demand from chunks
+            for i in range(self._sample_idx, len(self.rank_sample_indices)):
+                self._sample_idx = i + 1
+                global_idx = self.rank_sample_indices[i]
+                yield self._get_sample_from_chunks(global_idx)
+            
+            if not self.infinite:
+                logger.info("Preprocessed dataset epoch complete")
+                break
+            else:
+                self._sample_idx = 0
+                logger.info("Preprocessed dataset restarting epoch")
+    
+    def load_state_dict(self, state_dict):
+        self._sample_idx = state_dict["sample_idx"]
+    
+    def state_dict(self):
+        return {"sample_idx": self._sample_idx}
+
+
+# ============================================================================
 # Dataloader Builder
 # ============================================================================
 
@@ -331,7 +422,7 @@ def build_vl_dataloader(
     dp_world_size: int,
     dp_rank: int,
     processor: Any,  # VL processor
-    preprocess_fn: Callable,  # Preprocessing function
+    preprocess_fn: Callable,  # Preprocessing function (e.g., preprocess_qwen_visual_pil from train_spec)
     collate_fn: Callable,  # Collator for batching
     job_config: JobConfig,
     infinite: bool = True,
