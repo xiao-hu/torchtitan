@@ -23,7 +23,7 @@ hf_assets_path = "/checkpoints/xxie-sandbox/Qwen/Qwen3-VL-30B-A3B-Instruct"
 
 [optimizer]
 name = "AdamW"
-lr = 8e-4
+lr = 8e-5
 eps = 1e-8
 
 [lr_scheduler]
@@ -38,7 +38,7 @@ dataset = "vqav2"  # Vision-Language dataset from VL_DATASETS registry
 
 # Note: Sample packing is automatically enabled with buffer_size derived from seq_len
 # Formula: buffer_size = max(50, seq_len // 40) 
-# For seq_len=4096, this gives buffer_size ≈ 102 samples
+# For seq_len=8192, this gives buffer_size ≈ 204 samples
 
 [parallelism]
 # Data Parallelism
@@ -69,7 +69,7 @@ mode = "selective"  # Checkpoint select layers to save memory
 selective_ac_option = "op"  # Checkpoint based on operation policy
 
 [compile]
-enable=false  # 10-30% speedup
+enable=true  # 10-30% speedup
 components = ["model", "loss"]
 
 # Optional: Float8 quantization for further speedup

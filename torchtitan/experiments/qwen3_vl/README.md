@@ -612,7 +612,7 @@ By delegating language model parallelization to `parallelize_qwen3`, we get:
 ### Phase 10: Optimization
 
 - [x] Sample packing
-- [ ] Comile
+- [x] Comile
 - [ ] Optimize data loading workers
 - [ ] Profile with `torch.profiler`
 - [ ] Implement dynamic padding collator

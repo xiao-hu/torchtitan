@@ -24,7 +24,8 @@ import torch
 from datasets import load_dataset
 from transformers import Qwen3VLProcessor
 
-from torchtitan.experiments.qwen3_vl.datasets import DataCollatorForSupervisedDataset
+from torchtitan.experiments.qwen3_vl.datasets import \
+    DataCollatorForSupervisedDataset
 from torchtitan.experiments.qwen3_vl.datasets.vl_datasets import (
     HuggingFaceVLDataset, format_vqav2_sample)
 from torchtitan.experiments.qwen3_vl.train_spec import \
@@ -157,7 +158,7 @@ def test_collator_integration(
             input_dict, labels = collator_wrapper(samples)
             
             print("\n  Collator output:")
-            print(f"    Type: tuple of (dict, tensor)")
+            print("    Type: tuple of (dict, tensor)")
             print(f"    input_dict keys: {list(input_dict.keys())}")
             print(f"    input shape: {input_dict['input'].shape}")
             print(f"    labels shape: {labels.shape}")
@@ -252,7 +253,7 @@ def test_dataloader_with_packing(
         
         # Create dataset with packing - EXACT training config
         print(f"\nCreating HuggingFaceVLDataset with packing_buffer_size={packing_buffer_size}...")
-        print(f"  (Using batch_size=1, seq_len=4096 to EXACTLY match training config)")
+        print("  (Using batch_size=1, seq_len=4096 to EXACTLY match training config)")
         dataset = HuggingFaceVLDataset(
             dataset_name=dataset_name,
             dataset_path=dataset_path,
@@ -268,8 +269,8 @@ def test_dataloader_with_packing(
         print("✓ Dataset created")
         
         # CRITICAL: Now test collator with packed samples (THIS IS WHAT TRAINING DOES!)
-        print(f"\n🔥 CRITICAL TEST: Passing packed samples through collator...")
-        print(f"   (This is exactly what happens in training loop)")
+        print("\n🔥 CRITICAL TEST: Passing packed samples through collator...")
+        print("   (This is exactly what happens in training loop)")
         
         sample_count = 0
         error_count = 0
@@ -287,7 +288,7 @@ def test_dataloader_with_packing(
             
             # Debug: Check what packer returns
             if i == 0:
-                print(f"\n  📊 First packed sample from dataset:")
+                print("\n  📊 First packed sample from dataset:")
                 print(f"     Type: {type(packed_sample)}")
                 print(f"     Keys: {list(packed_sample.keys())}")
                 if "pixel_values" in packed_sample and packed_sample["pixel_values"] is not None:
@@ -337,9 +338,9 @@ def test_dataloader_with_packing(
                 
                 # This is the bug we're looking for!
                 if "expected Tensor" in str(e) and "but got list" in str(e):
-                    print(f"\n  🎯 FOUND THE BUG! This is the exact error from training!")
-                    print(f"     The packer returns pixel_values as a LIST,")
-                    print(f"     but the collator expects a TENSOR!")
+                    print("\n  🎯 FOUND THE BUG! This is the exact error from training!")
+                    print("     The packer returns pixel_values as a LIST,")
+                    print("     but the collator expects a TENSOR!")
                     return False
                 
         if error_count >= max_consecutive_errors:

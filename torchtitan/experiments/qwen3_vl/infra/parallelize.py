@@ -12,12 +12,12 @@ This file applies parallelisms to the Qwen3-VL model which consists of:
 2. Language model (model.language_model) - Full Qwen3 parallelization
 """
 
+import torch
 import torch.nn as nn
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
+from torchtitan.config import TORCH_DTYPE_MAP, JobConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.models.llama4.infra.parallelize import apply_compile
 from torchtitan.models.qwen3.infra.parallelize import parallelize_qwen3
 from torchtitan.tools.logging import logger
 
@@ -91,8 +91,11 @@ def parallelize_qwen3_vl(
         job_config.compile.enable and "model" in job_config.compile.components
     )
     if model_compile_enabled:
-        apply_compile(model.visual, job_config.compile)
-        logger.info("Applied torch.compile to vision encoder")
+        # Vision encoder has different structure (.blocks instead of .layers)
+        # Apply torch.compile directly to each block
+        for block in model.visual.blocks:
+            block.forward = torch.compile(block.forward, backend=job_config.compile.backend)
+        logger.info("Applied torch.compile to vision encoder blocks")
     
     # ========================================================================
     # STEP 4: Wrap Whole Model at Root Level

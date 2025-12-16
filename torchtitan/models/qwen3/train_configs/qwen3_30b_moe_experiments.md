@@ -9,7 +9,6 @@ Iterative optimization experiments to improve MFU from 2.34% to 29.90% on 8×H20
 pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 --force-reinstall
 cd <torchtitan_dir>
 pip install -r requirements.txt
-pip install 'transformers>=4.37.0'  # For Qwen3-VL support
 ```
 
 ### Verify Installation

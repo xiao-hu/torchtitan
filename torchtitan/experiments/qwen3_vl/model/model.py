@@ -20,7 +20,9 @@ from typing import Optional
 import torch
 from torch import nn
 
-from torchtitan.models.qwen3.model.model import Qwen3Model, apply_rotary_emb as qwen3_apply_rotary_emb
+from torchtitan.models.qwen3.model.model import Qwen3Model
+from torchtitan.models.qwen3.model.model import \
+    apply_rotary_emb as qwen3_apply_rotary_emb
 
 from .args import Qwen3VLModelArgs
 from .vision import Qwen3VLVisionEncoder
@@ -321,7 +323,7 @@ class Qwen3VLTextModel(Qwen3Model):
     def _patch_attention_layers(self):
         """Patch attention layers to use apply_rotary_emb_mrope instead of apply_rotary_emb."""
         from torchtitan.models.qwen3.model import model as qwen3_model_module
-        
+
         # Temporarily replace the apply_rotary_emb function in the qwen3 module
         # This way, all attention layers will use MroPE
         qwen3_model_module.apply_rotary_emb = apply_rotary_emb_mrope

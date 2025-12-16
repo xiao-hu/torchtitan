@@ -17,7 +17,7 @@ from collections import deque
 from typing import Any, Dict, List, Optional
 
 import torch
-from torchtitan.tools.logging import logger
+
 
 
 class VLSamplePacker:
