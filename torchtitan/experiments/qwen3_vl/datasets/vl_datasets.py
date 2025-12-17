@@ -194,8 +194,6 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
                 max_seq_length=seq_len,
                 buffer_size=packing_buffer_size,
                 batch_size=batch_size,
-                pad_token_id=151643,  # Qwen3 pad token
-                ignore_index=-100,
             )
             logger.info(
                 f"Sample packing enabled: buffer_size={packing_buffer_size}, "

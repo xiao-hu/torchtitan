@@ -9,13 +9,15 @@ Qwen3-VL dataset utilities (EXPERIMENTAL).
 
 This module contains all dataset infrastructure for Qwen3-VL:
 1. Generic VL dataset infrastructure (DatasetConfig pattern)
-2. Qwen3-VL specific preprocessing (from official implementation)
+2. Batch-free preprocessing and collation (optimized for TorchTitan)
 
 Architecture:
     torchtitan/experiments/qwen3_vl/datasets/
-    ├── vl_datasets.py                          # Generic VL infrastructure (EXPERIMENTAL)
-    ├── data_processor.py                       # Preprocessing (from official Qwen3-VL)
-    └── __init__.py                             # This file
+    ├── vl_datasets.py          # Generic VL infrastructure (EXPERIMENTAL)
+    ├── utils.py                # Batch-free preprocessing & collation
+    ├── packing.py              # Sample packing utilities
+    ├── data_processor.py       # Reference: Original Qwen3-VL preprocessing (UNUSED)
+    └── __init__.py             # This file
 
 Note: Once finalized and tested, vl_datasets.py may be promoted to
       torchtitan/hf_datasets/ for use by other VL models.
@@ -24,29 +26,24 @@ Usage Example:
     >>> from transformers import Qwen3VLProcessor
     >>> from torchtitan.experiments.qwen3_vl.datasets import (
     ...     build_vl_dataloader,
-    ...     preprocess_qwen_visual,
-    ...     DataCollatorForSupervisedDataset,
+    ...     preprocess_qwen_visual_pil,
+    ...     collate_vl_batch,
     ... )
     >>> 
     >>> processor = Qwen3VLProcessor.from_pretrained("Qwen/Qwen3-VL-30B-A3B-Instruct")
-    >>> collator = DataCollatorForSupervisedDataset(tokenizer=processor.tokenizer)
     >>> 
     >>> # Works with ANY dataset in VL_DATASETS registry!
     >>> dataloader = build_vl_dataloader(
     ...     dp_world_size=8,
     ...     dp_rank=0,
     ...     processor=processor,
-    ...     preprocess_fn=preprocess_qwen_visual,  # Qwen3-VL specific
-    ...     collate_fn=collator,                   # Qwen3-VL specific
+    ...     preprocess_fn=preprocess_qwen_visual_pil,
+    ...     collate_fn=lambda instances: collate_vl_batch(instances, processor),
     ...     job_config=job_config
     ... )
 """
-
-# Qwen3-VL specific preprocessing (verbatim from official implementation)
-from .data_processor import (IGNORE_INDEX, IMAGE_TOKEN_INDEX,
-                             VIDEO_TOKEN_INDEX,
-                             DataCollatorForSupervisedDataset,
-                             preprocess_qwen_visual)
+# Batch-free preprocessing and collation utilities
+from .utils import collate_vl_batch, preprocess_qwen_visual_pil
 # Generic VL infrastructure (EXPERIMENTAL - may move to torchtitan/hf_datasets/)
 from .vl_datasets import (VL_DATASETS, HuggingFaceVLDataset,
                           build_vl_dataloader, format_vqav2_sample)
@@ -57,11 +54,7 @@ __all__ = [
     "HuggingFaceVLDataset",
     "build_vl_dataloader",
     "format_vqav2_sample",
-    # Preprocessing (Qwen3-VL specific)
-    "preprocess_qwen_visual",
-    "DataCollatorForSupervisedDataset",
-    # Constants
-    "IGNORE_INDEX",
-    "IMAGE_TOKEN_INDEX",
-    "VIDEO_TOKEN_INDEX",
+    # Batch-free preprocessing and collation (optimized for TorchTitan)
+    "preprocess_qwen_visual_pil",
+    "collate_vl_batch",
 ]

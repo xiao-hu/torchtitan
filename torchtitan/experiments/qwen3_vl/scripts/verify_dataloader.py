@@ -24,12 +24,10 @@ import torch
 from datasets import load_dataset
 from transformers import Qwen3VLProcessor
 
-from torchtitan.experiments.qwen3_vl.datasets import \
-    DataCollatorForSupervisedDataset
+from torchtitan.experiments.qwen3_vl.datasets.utils import (
+    collate_vl_batch, preprocess_qwen_visual_pil)
 from torchtitan.experiments.qwen3_vl.datasets.vl_datasets import (
     HuggingFaceVLDataset, format_vqav2_sample)
-from torchtitan.experiments.qwen3_vl.train_spec import \
-    preprocess_qwen_visual_pil
 
 
 def verify_sample_format(sample_idx: int, original: dict, formatted: dict) -> tuple[bool, str]:
@@ -113,18 +111,6 @@ def test_collator_integration(
         )
         print("✓ Processor loaded")
         
-        # Create collator (same as train_spec.py)
-        base_collator = DataCollatorForSupervisedDataset(
-            tokenizer=processor.tokenizer
-        )
-        
-        # Wrapper (same as train_spec.py)
-        def collator_wrapper(instances):
-            batch = base_collator(instances)
-            labels = batch.pop("labels")
-            batch["input"] = batch.pop("input_ids")
-            return batch, labels
-        
         # Create dataset
         print("\nCreating dataset...")
         dataset = HuggingFaceVLDataset(
@@ -155,7 +141,7 @@ def test_collator_integration(
         # Test collator
         print(f"\nTesting collator with {len(samples)} samples...")
         try:
-            input_dict, labels = collator_wrapper(samples)
+            input_dict, labels = collate_vl_batch(samples, processor)
             
             print("\n  Collator output:")
             print("    Type: tuple of (dict, tensor)")
@@ -236,21 +222,6 @@ def test_dataloader_with_packing(
         )
         print("✓ Processor loaded")
         
-        # Create collator (EXACT training setup from train_spec.py)
-        print("\nCreating collator (training setup)...")
-        base_collator = DataCollatorForSupervisedDataset(
-            tokenizer=processor.tokenizer
-        )
-        
-        def collator_wrapper(instances):
-            """EXACT collator from train_spec.py - NO modifications"""
-            batch = base_collator(instances)
-            labels = batch.pop("labels")
-            batch["input"] = batch.pop("input_ids")
-            return batch, labels
-        
-        print("✓ Collator created")
-        
         # Create dataset with packing - EXACT training config
         print(f"\nCreating HuggingFaceVLDataset with packing_buffer_size={packing_buffer_size}...")
         print("  (Using batch_size=1, seq_len=4096 to EXACTLY match training config)")
@@ -315,7 +286,7 @@ def test_dataloader_with_packing(
             # 🔥 THIS IS THE CRITICAL TEST: Pass through collator!
             try:
                 # Wrap in list as training does (batch_size=1)
-                input_dict, labels = collator_wrapper([packed_sample])
+                input_dict, labels = collate_vl_batch([packed_sample], processor)
                 
                 if i < 3:  # Print first 3 for debugging
                     print(f"\n  ✓ Sample {i+1}: Collator succeeded")
