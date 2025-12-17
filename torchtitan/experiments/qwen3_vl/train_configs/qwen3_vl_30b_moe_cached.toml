@@ -34,7 +34,7 @@ local_batch_size = 1  # Set to 1: Qwen3-VL collator requires same-sized images p
 seq_len = 8192  # Context length for vision-language
 max_norm = 1.0  # Gradient clipping
 steps = 10  # Start with 10 steps for testing
-dataset = "vqav2"  # Vision-Language dataset from VL_DATASETS registry
+dataset = "vqav2_cached"  # Vision-Language dataset from VL_DATASETS registry
 
 # Note: Sample packing is automatically enabled with buffer_size derived from seq_len
 # Formula: buffer_size = max(50, seq_len // 40) 
@@ -59,7 +59,7 @@ fsdp_reshard_after_forward = "default"  # Memory-efficient resharding
 [checkpoint]
 enable = false
 folder = "checkpoint"
-interval = 500  # Save every 500 steps
+interval = 2  # Save every 500 steps
 last_save_model_only = false
 export_dtype = "float16"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]

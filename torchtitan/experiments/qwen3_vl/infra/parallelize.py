@@ -33,57 +33,80 @@ def parallelize_qwen3_vl(
     Strategy:
     - Vision encoder: Simple FSDP wrapping (no TP/EP/AC)
     - Language model: Delegate to parallelize_qwen3 (works because Qwen3VLTextModel extends Qwen3Model)
-    
-    Key insight: Qwen3VLTextModel extends Qwen3Model with identical structure (tok_embeddings, layers, 
-    norm, output), so we can reuse parallelize_qwen3 directly. This ensures proper MOE mesh handling
-    and avoids gradient clipping mesh mismatch errors.
-    
-    Args:
-        model: Qwen3VLModel instance with .visual and .language_model
-        parallel_dims: Parallelism configuration
-        job_config: Training job configuration
+    - Optimization: Create dp_mesh once and share between vision and language models
     """
     world_mesh = parallel_dims.world_mesh
-    language_model = model.language_model
-    
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
+    )
+
     # ========================================================================
-    # STEP 1: Wrap Vision Encoder with Simple FSDP (before language model parallelization)
+    # Create dp_mesh once for reuse (avoids duplicate mesh slicing)
     # ========================================================================
+    dp_mesh = None
     if parallel_dims.fsdp_enabled:
-        # Determine DP mesh
         if parallel_dims.dp_replicate_enabled:
+            # HSDP case: Need both dp_replicate and dp_shard_cp dimensions
+            # No pre-flattened mesh exists for this combination
+            # Must use tuple slicing (triggers deprecation warning until PT 2.11)
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
+            dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
         else:
-            dp_mesh_dim_names = ("dp_shard_cp",)
-        dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
-        
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
-        )
-        
-        # Simple FSDP wrapping for vision encoder layers
-        for transformer_block in model.visual.blocks:
-            fully_shard(
-                transformer_block,
-                mesh=dp_mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=True,
-            )
-        
-        logger.info("Applied FSDP to vision encoder")
+            # Standard FSDP: Use pre-flattened mesh (warning-free)
+            # This mesh was created during build_mesh() with _flatten()
+            dp_mesh = world_mesh["dp_shard_cp"]
+
+    # ========================================================================
+    # STEP 1: Vision Encoder - Comprehensive FSDP Wrapping
+    # ========================================================================
     
+    if parallel_dims.fsdp_enabled:
+        # Convert reshard_after_forward config to boolean
+        # "default" means True (reshard for memory efficiency)
+        reshard_config = job_config.parallelism.fsdp_reshard_after_forward
+        if isinstance(reshard_config, str):
+            vision_reshard = reshard_config.lower() != "false"
+        else:
+            vision_reshard = reshard_config
+        
+        # Wrap all vision encoder components
+        # ModuleLists (blocks, deepstack_merger_list) need individual wrapping
+        for name, module in model.visual.named_children():
+            if len(list(module.parameters())) == 0:
+                continue  # Skip modules without parameters
+            
+            if isinstance(module, nn.ModuleList):
+                # ModuleList: Wrap each sub-module individually
+                for sub_module in module:
+                    fully_shard(
+                        sub_module,
+                        mesh=dp_mesh,
+                        mp_policy=mp_policy,
+                        reshard_after_forward=vision_reshard,
+                    )
+                logger.info(f"Applied FSDP to {len(module)} modules in vision component: {name}")
+            else:
+                # Regular module: Wrap directly
+                fully_shard(
+                    module,
+                    mesh=dp_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=vision_reshard,
+                )
+                logger.info(f"Applied FSDP to vision component: {name}")
+
     # ========================================================================
     # STEP 2: Apply Full Qwen3 Parallelization to Language Model
     # ========================================================================
-    # This handles TP, EP, AC, Compile, and FSDP for the language model
-    # Works because Qwen3VLTextModel extends Qwen3Model with same structure
+    # Pass shared dp_mesh to avoid duplicate mesh creation
     parallelize_qwen3(
-        language_model,
+        model.language_model,
         parallel_dims,
         job_config,
     )
-    
+
     # ========================================================================
     # STEP 3: Optional Compile for Vision Encoder
     # ========================================================================
@@ -91,12 +114,15 @@ def parallelize_qwen3_vl(
         job_config.compile.enable and "model" in job_config.compile.components
     )
     if model_compile_enabled:
-        # Vision encoder has different structure (.blocks instead of .layers)
-        # Apply torch.compile directly to each block
-        for block in model.visual.blocks:
-            block.forward = torch.compile(block.forward, backend=job_config.compile.backend)
-        logger.info("Applied torch.compile to vision encoder blocks")
-    
+        # # Vision encoder has different structure (.blocks instead of .layers)
+        # # Apply torch.compile directly to each block
+        # for block in model.visual.blocks:
+        #     block.forward = torch.compile(block.forward, backend=job_config.compile.backend)
+        # logger.info("Applied torch.compile to vision encoder blocks")
+        # Compile entire visual module for better graph fusion
+        model.visual = torch.compile(model.visual, backend=job_config.compile.backend)
+        logger.info("Applied torch.compile to entire vision encoder")
+
     # ========================================================================
     # STEP 4: Wrap Whole Model at Root Level
     # ========================================================================
