@@ -25,13 +25,14 @@ def preprocess_qwen_visual_pil(sources, processor):
     """
     PIL-aware preprocessing for Qwen3-VL models with batch-free output.
     
-    This is an alternative to preprocess_qwen_visual from data_processor.py that:
-    - Handles PIL Images directly instead of requiring file paths
-    - Returns batch-free tensors for efficient packing
-    - Works with datasets like VQAv2 that provide PIL Images in memory
+    Expects sources to be formatted with processor-ready messages:
+        sources[0]["messages"] = [
+            {"role": "user", "content": [{"type": "image", "image": PIL.Image}, {"type": "text", "text": "..."}]},
+            {"role": "assistant", "content": "..."}
+        ]
     
     Args:
-        sources: List of formatted samples with PIL Images in 'image' field
+        sources: List of formatted samples with "messages" field
         processor: Qwen3VLProcessor instance
         
     Returns:
@@ -49,40 +50,16 @@ def preprocess_qwen_visual_pil(sources, processor):
     
     source = sources[0]
     
-    # Extract PIL images
-    pil_images = source.get("image", [])
-    if not isinstance(pil_images, list):
-        pil_images = [pil_images]
+    # Extract processor-ready messages (already formatted by format_vqav2_sample)
+    messages = source.get("messages", [])
     
-    # Build messages for processor (using PIL Images directly)
-    conversations = source.get("conversations", [])
-    messages = []
-    
-    for turn in conversations:
-        role = "user" if turn["from"] == "human" else "assistant"
-        text = turn["value"]
-        
-        if role == "user":
-            # Build content with PIL images
-            content = []
-            
-            # Handle <image> placeholders in text
-            text_parts = text.split("<image>")
-            
-            image_idx = 0
-            for i, part in enumerate(text_parts):
-                if i > 0 and image_idx < len(pil_images):
-                    # Insert image before this text part
-                    content.append({"type": "image", "image": pil_images[image_idx]})
-                    image_idx += 1
-                
-                if part.strip():
-                    content.append({"type": "text", "text": part.strip()})
-            
-            messages.append({"role": role, "content": content})
-        else:
-            # Assistant messages contain only text
-            messages.append({"role": role, "content": text})
+    # Extract PIL images from messages for processor
+    pil_images = []
+    for msg in messages:
+        if msg["role"] == "user" and isinstance(msg["content"], list):
+            for item in msg["content"]:
+                if item.get("type") == "image":
+                    pil_images.append(item["image"])
     
     # Use processor to handle PIL images
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)

@@ -39,33 +39,50 @@ def verify_sample_format(sample_idx: int, original: dict, formatted: dict) -> tu
     """
     errors = []
     
-    # Check required top-level keys
-    required_keys = {"conversations", "image", "data_path"}
+    # Check required top-level keys (new format uses "messages")
+    required_keys = {"messages"}
     if not required_keys.issubset(formatted.keys()):
         missing = required_keys - set(formatted.keys())
         errors.append(f"Missing required keys: {missing}")
     
-    # Check conversations structure
-    if "conversations" in formatted:
-        convos = formatted["conversations"]
-        if not isinstance(convos, list):
-            errors.append(f"'conversations' should be a list, got {type(convos)}")
-        elif len(convos) != 2:
-            errors.append(f"'conversations' should have 2 items, got {len(convos)}")
+    # Check messages structure
+    if "messages" in formatted:
+        messages = formatted["messages"]
+        if not isinstance(messages, list):
+            errors.append(f"'messages' should be a list, got {type(messages)}")
+        elif len(messages) != 2:
+            errors.append(f"'messages' should have 2 items, got {len(messages)}")
         else:
-            # Check first message (human)
-            if convos[0].get("from") != "human":
-                errors.append(f"First message should be from 'human', got '{convos[0].get('from')}'")
-            if "<image>" not in convos[0].get("value", ""):
-                errors.append("First message should contain '<image>' token")
-            if original.get("question", "") not in convos[0].get("value", ""):
-                errors.append("First message should contain the question")
+            # Check first message (user)
+            user_msg = messages[0]
+            if user_msg.get("role") != "user":
+                errors.append(f"First message should be from 'user', got '{user_msg.get('role')}'")
             
-            # Check second message (gpt)
-            if convos[1].get("from") != "gpt":
-                errors.append(f"Second message should be from 'gpt', got '{convos[1].get('from')}'")
+            # Check user content structure
+            user_content = user_msg.get("content", [])
+            if not isinstance(user_content, list):
+                errors.append(f"User content should be a list, got {type(user_content)}")
+            else:
+                # Should have image and text
+                has_image = any(item.get("type") == "image" for item in user_content)
+                has_text = any(item.get("type") == "text" for item in user_content)
+                if not has_image:
+                    errors.append("User content should contain an image")
+                if not has_text:
+                    errors.append("User content should contain text")
+                
+                # Check question is in text
+                question = original.get("question", "")
+                text_parts = [item.get("text", "") for item in user_content if item.get("type") == "text"]
+                if question and not any(question in text for text in text_parts):
+                    errors.append(f"Question '{question}' not found in user text")
             
-            answer = convos[1].get("value", "")
+            # Check second message (assistant)
+            assistant_msg = messages[1]
+            if assistant_msg.get("role") != "assistant":
+                errors.append(f"Second message should be from 'assistant', got '{assistant_msg.get('role')}'")
+            
+            answer = assistant_msg.get("content", "")
             # Check that answer is either from original answers or "unknown"
             if answer != "unknown":
                 original_answers = original.get("answers", [])
@@ -73,19 +90,6 @@ def verify_sample_format(sample_idx: int, original: dict, formatted: dict) -> tu
                     valid_answers = [a.get("answer", "") for a in original_answers if isinstance(a, dict)]
                     if answer not in valid_answers:
                         errors.append(f"Answer '{answer}' not in original answers: {valid_answers}")
-    
-    # Check image structure
-    if "image" in formatted:
-        images = formatted["image"]
-        if not isinstance(images, list):
-            errors.append(f"'image' should be a list, got {type(images)}")
-        elif len(images) != 1:
-            errors.append(f"'image' should have 1 item, got {len(images)}")
-    
-    # Check data_path
-    if "data_path" in formatted:
-        if formatted["data_path"] != "":
-            errors.append(f"'data_path' should be empty string, got '{formatted['data_path']}'")
     
     if errors:
         return False, "; ".join(errors)
@@ -402,7 +406,7 @@ def main():
                 
                 if is_valid:
                     print(f"  ✓ {message}")
-                    print(f"  Formatted answer: {formatted['conversations'][1]['value']}")
+                    print(f"  Formatted answer: {formatted['messages'][1]['content']}")
                     success_count += 1
                 else:
                     print(f"  ✗ VALIDATION ERROR: {message}")

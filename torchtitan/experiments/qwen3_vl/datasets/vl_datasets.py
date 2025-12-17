@@ -43,7 +43,7 @@ def _load_hf_dataset(dataset_path: str, split: str):
 
 def format_vqav2_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Process VQAv2 sample into Qwen3-VL conversation format.
+    Process VQAv2 sample into processor-ready message format.
     
     Input (VQAv2 format):
         {
@@ -56,18 +56,24 @@ def format_vqav2_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
             ...
         }
     
-    Output (Qwen3-VL conversation format):
+    Output (Processor-ready format):
         {
-            "conversations": [
-                {"from": "human", "value": "<image>What color is the car?"},
-                {"from": "gpt", "value": "Red"}
-            ],
-            "image": [PIL.Image],
-            "data_path": ""
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PIL.Image},
+                        {"type": "text", "text": "What color is the car?"}
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": "Red"
+                }
+            ]
         }
     """
     # Get the most common answer (VQAv2 has multiple annotations)
-    # answers is a list of dicts: [{"answer": str, "answer_confidence": str, "answer_id": int}, ...]
     answers_list = sample.get("answers", [])
     if answers_list and isinstance(answers_list, list):
         # Extract the "answer" field from the first annotation
@@ -75,23 +81,27 @@ def format_vqav2_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     else:
         answer = "unknown"
     
-    # Format question with image placeholder
+    # Extract PIL image
+    pil_image = sample["image"]
     question = sample["question"]
     
-    # Build conversation in Qwen3-VL format
+    # Build messages in processor-ready format
+    # User message: image + text
+    # Assistant message: text only
     return {
-        "conversations": [
+        "messages": [
             {
-                "from": "human",
-                "value": f"<image>{question}"
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_image},
+                    {"type": "text", "text": question}
+                ]
             },
             {
-                "from": "gpt",
-                "value": answer
+                "role": "assistant",
+                "content": answer
             }
-        ],
-        "image": [sample["image"]],  # PIL Image - processor will handle it
-        "data_path": ""  # Empty since we're providing PIL images directly
+        ]
     }
 
 
