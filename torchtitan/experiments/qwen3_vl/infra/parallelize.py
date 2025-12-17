@@ -67,7 +67,8 @@ def parallelize_qwen3_vl(
         # "default" means True (reshard for memory efficiency)
         reshard_config = job_config.parallelism.fsdp_reshard_after_forward
         if isinstance(reshard_config, str):
-            vision_reshard = reshard_config.lower() != "false"
+            vision_reshard = reshard_config.lower() != "never"
+            # try this: vision_reshard = reshard_config.lower() == "always"
         else:
             vision_reshard = reshard_config
         
@@ -110,18 +111,24 @@ def parallelize_qwen3_vl(
     # ========================================================================
     # STEP 3: Optional Compile for Vision Encoder
     # ========================================================================
-    model_compile_enabled = (
-        job_config.compile.enable and "model" in job_config.compile.components
+    visual_compile_enabled = (
+        job_config.compile.enable and "visual" in job_config.compile.components
     )
-    if model_compile_enabled:
-        # # Vision encoder has different structure (.blocks instead of .layers)
-        # # Apply torch.compile directly to each block
-        # for block in model.visual.blocks:
-        #     block.forward = torch.compile(block.forward, backend=job_config.compile.backend)
-        # logger.info("Applied torch.compile to vision encoder blocks")
-        # Compile entire visual module for better graph fusion
+    if visual_compile_enabled:
+        # try fullgraph=True, use TORCH_LOGS="recompiles,guards" to debug, use TORCH_LOGS="dynamic" to check the code forcing recompile
+        # advanced: rewrite a Qwen-style view operation so that it is "compiler-friendly" and stops triggering recompiles
         model.visual = torch.compile(model.visual, backend=job_config.compile.backend)
         logger.info("Applied torch.compile to entire vision encoder")
+
+        # compile the core part only, does not work
+        # for i, block in enumerate(model.visual.blocks):
+        #     model.visual.blocks[i] = torch.compile(block)
+        # logger.info("Applied torch.compile to vision encoder blocks")
+
+        # dynamic compile, try mark_dynamic(input_tensor, 1)/maybe_mark_dynamic(grid_thw, 0) before the forward pass instead
+        # try mode="max-autotune-no-cudagraphs"
+        # model.visual = torch.compile(model.visual, backend=job_config.compile.backend, dynamic=True)
+        # logger.info("Applied torch.compile to entire vision encoder")
 
     # ========================================================================
     # STEP 4: Wrap Whole Model at Root Level

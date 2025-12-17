@@ -70,7 +70,7 @@ selective_ac_option = "op"  # Checkpoint based on operation policy
 
 [compile]
 enable=true  # 10-30% speedup
-components = ["model", "loss"]
+components = ["model", "visual", "loss"]
 
 # Optional: Float8 quantization for further speedup
 # [quantize.linear.float8]

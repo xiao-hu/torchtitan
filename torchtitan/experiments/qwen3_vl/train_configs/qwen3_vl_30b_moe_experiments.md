@@ -18,8 +18,12 @@ CONFIG_FILE='./torchtitan/experiments/qwen3_vl/train_configs/qwen3_vl_30b_moe.to
 ### Exp 1: Baseline (No Packing)
 
 ```toml
-local_batch_size = 1, seq_len = 8192, compile = false
+local_batch_size = 1
+seq_len = 8192
+compile = false
 ```
+
+**Note**: `local_batch_size > 1` is not supported due to variable image resolutions across samples
 
 **Results**: `memory: 63.54GiB (45%), tps: 25, mfu: 0.08%`
 
@@ -30,7 +34,9 @@ local_batch_size = 1, seq_len = 8192, compile = false
 ### Exp 2: Sample Packing
 
 ```toml
-local_batch_size = 1, seq_len = 8192, compile = false
+local_batch_size = 1
+seq_len = 8192
+compile = false
 # Packing enabled with buffer_size=204
 ```
 
@@ -39,48 +45,30 @@ local_batch_size = 1, seq_len = 8192, compile = false
 **Analysis**:
 - ✅ +40% throughput (25→35 tps)
 - ✅ +75% MFU (0.08%→0.14%)
-- ⚠️ Still very low MFU (should be 40-60%)
-- ⚠️ CPU bottleneck (97-98% CPU utilization)
+- ⚠️ Still very low MFU
 
 ---
 
 ### Exp 3: Torch Compile
 
 ```toml
-local_batch_size = 1, seq_len = 8192, compile = true
+local_batch_size = 1
+seq_len = 8192
+compile = true
 ```
 
 **Results**: `memory: 103.97GiB (74%), tps: 34, mfu: 0.14%`
 
 **Analysis**:
 - ✅ Reduced memory usage
-- ❌ No MFU improvement (step 2 is still compiling)
-- ❌ CPU remains bottleneck (100% utilization)
+- MFU is mostly the same, suggesting other bottlenecks
+**Bottleneck Analysis**
 
-**Note**: Compile warmup takes 20-40 steps due to variable packed shapes
-
----
-
-## Bottleneck Analysis
-
-**GPU Profile**: 30-38% utilization (idle 60-70%)  
-**CPU Profile**: 97-98% utilization (MAXED OUT!)
-
-**Time per Step**:
-```
-PIL decode + load:  60-100ms  ← CPU bottleneck
-Sample packing:     50-80ms   ← CPU bottleneck  
-Tokenization:       10-20ms   ← CPU bottleneck
-GPU compute:        100-150ms
-──────────────────────────────
-Total:              220-350ms
-GPU idle:           70-200ms  ← 60-70% wasted!
-```
-
-**Key Challenges**:
-* Multi-process data workers are not supported in torchtitan yet: https://github.com/pytorch/torchtitan/issues/2073
-* PIL causes **segmentation faults** with CUDA + multiprocessing
-* The default qwen3-vl collator does not support variable image sizes across samples
+* Is visual model or language model the bottleneck?
+* Visual data loading efficiency?
+  * Loading and preprocessing visual data is more CPU intensive
+  * Multi-process data workers are not supported in TorchTitan yet: https://github.com/pytorch/torchtitan/issues/2073
+  * PIL causes **segmentation faults** with CUDA + multiprocessing
 
 ### Exp 4: Text-Only Training Baseline
 
@@ -126,37 +114,69 @@ dataset = "c4"  # Text-only dataset from DATASETS registry
 
 ---
 
-### Exp 5: Offline Data Preprocessing (Future Work)
+### Exp 5: 
+The bottleneck is from Visual part.
+Tried cached dataset (cache preprocess visual data to tensors and load tensors directly during training), but MFU is not improved.
 
-**Goal**: Improve multimodal data loading efficiency through offline preprocessing.
+Revisit vision model parallelization.
+FSDP was only applied to core blocks.
+Extend FSDP to all visual models:
 
-**Approach**: Pre-process and cache vision data to reduce CPU bottleneck during training.
+```
+[rank0]:[titan] 2025-12-17 18:16:22,736 - root - INFO - step:  1  loss: 11.6715  grad_norm: 413993.1250  memory: 75.25GiB(53.86%)  tps: 150  tflops: 6.11  mfu: 0.62%                                             
+[rank0]:[titan] 2025-12-17 18:16:50,801 - root - INFO - step:  2  loss:  9.9699  grad_norm: 30038.7969  memory: 102.62GiB(73.44%)  tps: 285  tflops: 11.64  mfu: 1.18%
+[rank0]:[titan] 2025-12-17 18:17:00,445 - root - INFO - step:  3  loss: 11.5645  grad_norm: 20174.4258  memory: 102.83GiB(73.60%)  tps: 833  tflops: 33.98  mfu: 3.44%
+[rank0]:[titan] 2025-12-17 18:17:10,540 - root - INFO - step:  4  loss: 16.1480  grad_norm: 4221.2612  memory: 102.83GiB(73.60%)  tps: 792  tflops: 32.33  mfu: 3.27%
+[rank0]:[titan] 2025-12-17 18:17:21,030 - root - INFO - step:  5  loss:  7.3720  grad_norm: 496.6781  memory: 103.01GiB(73.72%)  tps: 771  tflops: 31.48  mfu: 3.18%
+[rank0]:[titan] 2025-12-17 18:17:32,345 - root - INFO - step:  6  loss: 13.0652  grad_norm: 313.7617  memory: 103.18GiB(73.85%)  tps: 721  tflops: 29.43  mfu: 2.98%
+[rank0]:[titan] 2025-12-17 18:17:47,824 - root - INFO - step:  7  loss:  7.5180  grad_norm: 70.6903  memory: 103.18GiB(73.85%)  tps: 521  tflops: 21.25  mfu: 2.15%
+[rank0]:[titan] 2025-12-17 18:18:02,113 - root - INFO - step:  8  loss: 10.3346  grad_norm: 128.6145  memory: 103.25GiB(73.90%)  tps: 355  tflops: 14.48  mfu: 1.46%
+[rank0]:[titan] 2025-12-17 18:18:20,413 - root - INFO - step:  9  loss:  8.3097  grad_norm: 55.0017  memory: 103.50GiB(74.08%)  tps: 443  tflops: 18.07  mfu: 1.83%
+[rank0]:[titan] 2025-12-17 18:18:24,978 - root - INFO - step: 10  loss:  6.8966  grad_norm: 53.4530  memory: 103.50GiB(74.08%)  tps: 1,764  tflops: 71.98  mfu: 7.28%
+```
 
-**Design**: See [offline data process](../datasets/offline_data_process.md) for detailed implementation.
+Observations:
+* MFU improved significantly, but not stable
+* Disabling compile for the vision model decreases the model's performance significantly: MFU drops back to ~0.13%
+* Still lags behind text-only model. 
 
-**Expected Benefits**:
-- Reduced CPU load during training
-- Faster data loading pipeline
-- Better GPU utilization for multimodal training
+Potential issues:
+* variable text length, image numbers and resolutions in the training data lead to frequent recompiling
 
----
+Identified issue with MFU calculation, visual model not counted (see [analysis](../mfu_analysis.md)). MFU underestimated by ~10%. Yet to fix.
 
-## Summary
+### Exp 6: Text Sequence Padding
 
-| Experiment | Dataset | Config | TPS | MFU | Memory | Notes |
-|------------|---------|--------|-----|-----|--------|-------|
-| Exp 1 | VQAv2 | No packing, compile=false | 25 | 0.08% | 63.5GB (45%) | Baseline, low utilization |
-| Exp 2 | VQAv2 | Packing enabled | 35 | 0.14% | 120.5GB (86%) | +40% throughput, CPU bottleneck |
-| Exp 3 | VQAv2 | Compile=true | 34 | 0.14% | 104GB (74%) | Lower memory, still CPU bound |
-| Exp 4 | C4 (text) | bs=4, seq=12288 | 6,500 | 33% | 116.5GB (83%) | **185x faster**, no CPU bottleneck |
+Pad sequence length to a multiple of 256 to reduce text model recompile: 
+```
+...
+[rank0]:[titan] 2025-12-17 19:29:41,263 - root - INFO - step:  8  loss:  7.2810  grad_norm: 54.2424  memory: 103.27GiB(73.91%)  tps: 269  tflops: 10.98  mfu: 1.11%
+[rank0]:[titan] 2025-12-17 19:29:54,609 - root - INFO - step:  9  loss: 11.3383  grad_norm: 140.1408  memory: 103.60GiB(74.15%)  tps: 614  tflops: 25.05  mfu: 2.53%
+[rank0]:[titan] 2025-12-17 19:29:59,137 - root - INFO - step: 10  loss:  9.5201  grad_norm: 43.1138  memory: 103.60GiB(74.15%)  tps: 1,810  tflops: 73.87  mfu: 7.47%
+```
 
-**Key Findings**:
-1. **Multimodal training is CPU-bound** due to PIL image decoding and data preprocessing
-2. **Sample packing** provides moderate improvements (+40% throughput) but doesn't solve the CPU bottleneck
-3. **Text-only training** achieves excellent performance (33% MFU), validating that the model and infrastructure are capable
-4. **Root cause**: Image preprocessing dominates the training loop, leaving GPU idle 60-70% of the time
+* It seems that padding sequence length in collator doesn't help much.
+* However, enable profiling and found that recompile is indeed the bottleneck and it takes over 70% GPU cycles.
+* Likely bottleneck: Visual model recompiles frequently due to variable image numbers and resolution in the training data
 
-**Recommendations**:
-- Implement offline data preprocessing (Exp 5) to cache processed images
-- Consider alternative image loading libraries that support multiprocessing better
-- Explore async data loading to overlap CPU preprocessing with GPU compute
+## Summary:
+* We enabled Qwen3-VL MoE. 
+* The language model supports full N-D parallelism.
+* The vision encoder is small and is parallelized via FSDP2
+* When training Qwen3-VL-30B-A3B-Instruct on C4 (text only), we got over 30% MFU, matching what we observed for Qwen3 text-only model.
+* When training Qwen3-VL-30B-A3B-Instruct on VQAV2 (text + visual), we got unstable MFU 2-7%.
+  * Due to variable image resolutions in VQAV2, we cannot batch multiple samples (unless we pad pixels or resize images).
+  * We enabling sample packing to improve training efficiency keeping local_batch_size=1.
+  
+## Future Work:
+* Optimize the compilation of the visual model to reduce recompile (70% of the GPU time)
+  * Do we need to support variable resolutions?
+  * Do we need to support variable number of images per sample/sequence?
+  * Optimize torch.compile visual model
+    * General optimizations: e.g., fullgraph, compile mode, etc.
+    * Targeted optimization: mark dynamic dimensions for pixel values/grid_thw, etc.
+* Optimize sample packing: loss scaling, block mask
+* Enable multiple data workers to improve VL data loading efficiency:
+  * Need to solve the PIL segmentation fault error
+  * May not be the major bottleneck for the VQAV2 dataset but needed to enable video data training
+* Fix MFU calculation in TorchTitan (see [analysis](../mfu_analysis.md))

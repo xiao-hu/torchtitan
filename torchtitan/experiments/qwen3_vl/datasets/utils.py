@@ -163,7 +163,10 @@ def collate_vl_batch(instances, tokenizer):
     labels = [inst["labels"] for inst in instances]
     position_ids = [inst["position_ids"] for inst in instances]
     
-    # Pad sequences to max length in batch
+    # Pad sequences to max length in batch, rounded up to multiple of 512
+    # This significantly reduces torch.compile recompilations while keeping memory overhead low
+    PADDING_MULTIPLE = 256
+    
     input_ids = pad_sequence(
         input_ids, batch_first=True, padding_value=tokenizer.tokenizer.pad_token_id
     )
@@ -171,8 +174,19 @@ def collate_vl_batch(instances, tokenizer):
         labels, batch_first=True, padding_value=IGNORE_INDEX
     )
     
-    # Pad position_ids: [3, seq] → [3, max_seq] for each instance, then stack
+    # Round up to nearest multiple of PADDING_MULTIPLE
     max_len = input_ids.shape[1]
+    max_len = ((max_len + PADDING_MULTIPLE - 1) // PADDING_MULTIPLE) * PADDING_MULTIPLE
+    
+    # Apply padding if needed
+    if input_ids.shape[1] < max_len:
+        pad_len = max_len - input_ids.shape[1]
+        input_ids = torch.nn.functional.pad(
+            input_ids, (0, pad_len), value=tokenizer.tokenizer.pad_token_id
+        )
+        labels = torch.nn.functional.pad(
+            labels, (0, pad_len), value=IGNORE_INDEX
+        )
     padded_pos_ids = []
     for pos_id in position_ids:
         # pos_id is [3, seq], pad to [3, max_len]

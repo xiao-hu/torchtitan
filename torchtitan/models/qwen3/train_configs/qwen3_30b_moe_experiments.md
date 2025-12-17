@@ -211,40 +211,30 @@ tps: 6,260  tflops: 295.72  mfu: 29.90%
 
 ## Key Takeaways
 
-### 1. **Tensor Parallelism (TP) is Inefficient for MOE**
-- TP introduces communication overhead across **every layer** (including non-MOE layers)
-- **Keeping TP=1** is essential to avoid unnecessary all-reduce operations
-- MOE models benefit more from expert-level parallelism than tensor-level parallelism
+### 1. **TP/ETP is Inefficient for MOE**
+- TP/ETP are less computationally efficient compared to EP.
+- Computationally, MOE models benefit more from expert-level parallelism than tensor-level parallelism
+- TP introduces O(N) All-Reduce communication overhead across **every layer**
 
-### 2. **Expert Tensor Parallelism (ETP) Should Be Minimal**
-- With TP=1, keeping **ETP=1** prevents unnecessary sharding within experts
-- Maximizes computation-to-communication ratio on expert devices
-- Reduces synchronization points during expert forward/backward passes
-
-### 3. **Expert Parallelism (EP) is the Dominant Knob**
-- EP effectively shards heavy MOE weights across devices
-- However, **lower EP (4) outperforms higher EP (8)** due to:
+### 2. **Expert Parallelism (EP) is the Dominant Knob**
+- EP shards heavy MOE weights across devices in a more computation effect way
+- However, EP involves higher O(N^2) communication complexity (All-to-All)
+- **lower EP (4) outperforms higher EP (8)** due to:
   - Reduced All-to-All communication complexity
-  - Lower communication buffer overhead
-  - Better balance between parallelism and communication cost
+  - Lower communication buffer overhead, less memory pressure
 
-### 4. **Batch Size for Memory Saturation**
+### 3. **Keep Memory Headroom Near the Sweet Spot**
 - After optimizing parallelism, use batch size to target **80-90% memory usage**
+- Operating at >95% memory causes **thrashing and allocation retries**
 - Once communication becomes bottleneck, **increasing batch size decreases MFU**
 - Sweet spot: `local_batch_size = 4-6` with `seq_len = 8192-12288`
 
-### 5. **Memory Headroom is Critical**
-- Operating at >95% memory causes **thrashing and allocation retries**
-- Aim for **80-85% memory utilization** for optimal performance
-- Memory pressure destroys MFU regardless of parallelism strategy
-
-### 6. **Sequence Length Boosts Compute-to-Communication Ratio**
+### 4. **Sequence Length Boosts Compute-to-Communication Ratio**
 - Increasing `seq_len` significantly improves C/A ratio (compute/all-to-all)
 - Longer sequences amortize communication overhead over more computation
 - **seq_len = 12288** provides best MFU with `batch_size = 4`
 
-### 7. **Torch Compile is Essential**
-- Provides **10-30% speedup** with minimal code changes
+### 5. **Torch Compile Speeds Up Training with Minimal Code Changes**
 - Critical for achieving competitive MFU on modern GPUs
 - Should be enabled in all production training runs
 

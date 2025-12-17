@@ -11,6 +11,9 @@ This implementation extends the base SamplePacker with VL-specific field handlin
 - Properly aggregates image_grid_thw across packed samples
 - Concatenates position_ids for 3D RoPE
 - Handles batch-free tensor formats throughout
+
+Check: block-diagonal masking
+global batch normalization: loss function sums the token-wise losses and divides by the total number of non-pad tokens across the entire global batch
 """
 
 from typing import Any, Dict, List

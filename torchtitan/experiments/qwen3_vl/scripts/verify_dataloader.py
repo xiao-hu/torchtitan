@@ -96,6 +96,104 @@ def verify_sample_format(sample_idx: int, original: dict, formatted: dict) -> tu
     return True, "OK"
 
 
+def test_padding_quantization(
+    dataset_name: str = "vqav2",
+    dataset_path: str = "lmms-lab/VQAv2",
+    num_batches: int = 10,
+):
+    """Test that collator pads to multiples of 128."""
+    print("\n" + "=" * 60)
+    print("TESTING PADDING QUANTIZATION (Multiple of 128)")
+    print("=" * 60)
+    
+    try:
+        # Load processor
+        print("Loading Qwen3VL processor...")
+        processor = Qwen3VLProcessor.from_pretrained(
+            "Qwen/Qwen3-VL-30B-A3B-Instruct",
+            trust_remote_code=True
+        )
+        print("✓ Processor loaded")
+        
+        # Create dataset
+        print("\nCreating dataset...")
+        dataset = HuggingFaceVLDataset(
+            dataset_name=dataset_name,
+            dataset_path=dataset_path,
+            processor=processor,
+            preprocess_fn=preprocess_qwen_visual_pil,
+            batch_size=2,  # Use batch_size=2 to see varying lengths
+            seq_len=512,
+            packing_buffer_size=0,
+            dp_rank=0,
+            dp_world_size=1,
+            infinite=False,
+        )
+        print("✓ Dataset created")
+        
+        print(f"\nTesting {num_batches} batches for padding quantization...")
+        print("\nBatch | Original Max | Padded To | Is Multiple of 128?")
+        print("-" * 60)
+        
+        all_pass = True
+        unique_lengths = set()
+        
+        for batch_idx in range(num_batches):
+            # Collect samples for one batch
+            samples = []
+            for i, sample in enumerate(dataset):
+                if i >= 2:  # batch_size=2
+                    break
+                samples.append(sample)
+            
+            if len(samples) < 2:
+                print(f"Batch {batch_idx+1}: Skipped (insufficient samples)")
+                continue
+            
+            # Get original lengths
+            original_lengths = [s['input_ids'].shape[0] for s in samples]
+            original_max = max(original_lengths)
+            
+            # Apply collator
+            input_dict, labels = collate_vl_batch(samples, processor)
+            padded_length = input_dict['input'].shape[1]
+            
+            # Check if multiple of 128
+            is_multiple = (padded_length % 128 == 0)
+            status = "✓" if is_multiple else "✗"
+            
+            print(f"  {batch_idx+1:2d}  |    {original_max:4d}      |   {padded_length:4d}    | {status} {'' if is_multiple else 'FAIL!'}")
+            
+            unique_lengths.add(padded_length)
+            
+            if not is_multiple:
+                all_pass = False
+        
+        print("-" * 60)
+        print(f"\nUnique padded lengths observed: {sorted(unique_lengths)}")
+        print(f"Number of unique lengths: {len(unique_lengths)}")
+        print(f"Expected reduction: ~{num_batches // max(1, len(unique_lengths))}x fewer recompilations")
+        
+        if all_pass:
+            print("\n✓ All batches padded to multiples of 128!")
+            print("=" * 60)
+            print("PADDING QUANTIZATION TEST PASSED")
+            print("=" * 60)
+            return True
+        else:
+            print("\n✗ Some batches NOT padded to multiples of 128!")
+            print("=" * 60)
+            print("PADDING QUANTIZATION TEST FAILED")
+            print("=" * 60)
+            return False
+            
+    except Exception as e:
+        print(f"\n✗ TEST FAILED: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_collator_integration(
     dataset_name: str = "vqav2",
     dataset_path: str = "lmms-lab/VQAv2",
@@ -341,6 +439,167 @@ def test_dataloader_with_packing(
         return False
 
 
+def analyze_token_ratio(
+    dataset_name: str = "vqav2",
+    dataset_path: str = "lmms-lab/VQAv2",
+    num_samples: int = 100,
+):
+    """Analyze the ratio of text tokens to vision tokens in the dataset."""
+    print("\n" + "=" * 60)
+    print("ANALYZING TEXT VS VISION TOKEN RATIO")
+    print("=" * 60)
+    
+    try:
+        # Load processor
+        print("Loading Qwen3VL processor...")
+        processor = Qwen3VLProcessor.from_pretrained(
+            "Qwen/Qwen3-VL-30B-A3B-Instruct",
+            trust_remote_code=True
+        )
+        print("✓ Processor loaded")
+        
+        # Special token IDs for vision tokens
+        image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image|>")
+        video_token_id = processor.tokenizer.convert_tokens_to_ids("<|video|>")
+        vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        
+        print(f"\nVision token IDs:")
+        print(f"  <|image|>: {image_token_id}")
+        print(f"  <|video|>: {video_token_id}")
+        print(f"  <|vision_start|>: {vision_start_id}")
+        print(f"  <|vision_end|>: {vision_end_id}")
+        
+        # Create dataset
+        print(f"\nCreating dataset (analyzing {num_samples} samples)...")
+        dataset = HuggingFaceVLDataset(
+            dataset_name=dataset_name,
+            dataset_path=dataset_path,
+            processor=processor,
+            preprocess_fn=preprocess_qwen_visual_pil,
+            batch_size=1,
+            seq_len=8192,  # Large seq_len to capture full sequences
+            packing_buffer_size=0,  # No packing to see individual samples
+            dp_rank=0,
+            dp_world_size=1,
+            infinite=False,
+        )
+        print("✓ Dataset created")
+        
+        # Analyze samples
+        print(f"\nAnalyzing {num_samples} samples...")
+        
+        total_tokens = 0
+        total_vision_tokens = 0
+        total_text_tokens = 0
+        total_vision_marker_tokens = 0  # <|vision_start|>, <|vision_end|>, <|image|>
+        
+        sample_stats = []
+        
+        for i, sample in enumerate(dataset):
+            if i >= num_samples:
+                break
+            
+            input_ids = sample['input_ids']
+            seq_len = input_ids.shape[0]
+            
+            # Count vision-related tokens
+            # Vision tokens are the actual image patch tokens (not just markers)
+            # They appear between <|vision_start|> and <|vision_end|>
+            
+            # Find vision regions
+            vision_regions = []
+            in_vision = False
+            start_idx = None
+            
+            for j, token_id in enumerate(input_ids):
+                if token_id == vision_start_id:
+                    in_vision = True
+                    start_idx = j
+                elif token_id == vision_end_id and in_vision:
+                    in_vision = False
+                    if start_idx is not None:
+                        # Count tokens between vision_start and vision_end (inclusive)
+                        vision_regions.append((start_idx, j + 1))
+            
+            # Count tokens
+            nvision_tokens_in_sample = 0
+            nmarker_tokens = 0
+            
+            for start, end in vision_regions:
+                region_length = end - start
+                nvision_tokens_in_sample += region_length
+                # Markers are vision_start, vision_end, and any image tokens
+                nmarker_tokens += 2  # vision_start and vision_end
+            
+            # Count image/video marker tokens outside vision regions
+            for token_id in input_ids:
+                if token_id in [image_token_id, video_token_id]:
+                    nmarker_tokens += 1
+            
+            ntext_tokens_in_sample = seq_len - nvision_tokens_in_sample
+            
+            total_tokens += seq_len
+            total_vision_tokens += nvision_tokens_in_sample
+            total_text_tokens += ntext_tokens_in_sample
+            total_vision_marker_tokens += nmarker_tokens
+            
+            sample_stats.append({
+                'seq_len': seq_len,
+                'nvision': nvision_tokens_in_sample,
+                'ntext': ntext_tokens_in_sample,
+                'nmarkers': nmarker_tokens,
+                'vision_pct': 100 * nvision_tokens_in_sample / seq_len if seq_len > 0 else 0
+            })
+            
+            # Print first few samples for debugging
+            if i < 5:
+                print(f"  Sample {i+1}: seq_len={seq_len}, "
+                      f"vision={nvision_tokens_in_sample} ({sample_stats[-1]['vision_pct']:.1f}%), "
+                      f"text={ntext_tokens_in_sample}, "
+                      f"markers={nmarker_tokens}")
+        
+        # Calculate statistics
+        avg_vision_pct = 100 * total_vision_tokens / total_tokens if total_tokens > 0 else 0
+        avg_text_pct = 100 * total_text_tokens / total_tokens if total_tokens > 0 else 0
+        
+        print("\n" + "=" * 60)
+        print("TOKEN RATIO ANALYSIS RESULTS")
+        print("=" * 60)
+        print(f"Total samples analyzed: {len(sample_stats)}")
+        print(f"\nAggregate Statistics:")
+        print(f"  Total tokens: {total_tokens:,}")
+        print(f"  Vision tokens: {total_vision_tokens:,} ({avg_vision_pct:.2f}%)")
+        print(f"  Text tokens: {total_text_tokens:,} ({avg_text_pct:.2f}%)")
+        print(f"  Vision marker tokens: {total_vision_marker_tokens:,}")
+        
+        # Per-sample statistics
+        vision_pcts = [s['vision_pct'] for s in sample_stats]
+        print(f"\nPer-Sample Vision Token Percentage:")
+        print(f"  Min: {min(vision_pcts):.2f}%")
+        print(f"  Max: {max(vision_pcts):.2f}%")
+        print(f"  Mean: {sum(vision_pcts) / len(vision_pcts):.2f}%")
+        print(f"  Median: {sorted(vision_pcts)[len(vision_pcts)//2]:.2f}%")
+        
+        # Recommendations for FLOPs calculation
+        print("\n" + "=" * 60)
+        print("RECOMMENDATIONS FOR MFU CALCULATION")
+        print("=" * 60)
+        print(f"Use vision_token_ratio = {avg_vision_pct/100:.3f} (≈{avg_vision_pct:.1f}%)")
+        print(f"This means in a typical batch:")
+        print(f"  ~{avg_vision_pct:.1f}% of tokens go through vision encoder")
+        print(f"  ~{avg_text_pct:.1f}% of tokens go through text decoder only")
+        print("=" * 60)
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n✗ TOKEN RATIO ANALYSIS FAILED: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify Qwen3-VL dataloader and packing")
     parser.add_argument(
@@ -348,6 +607,17 @@ def main():
         type=int,
         default=10,
         help="Number of samples to verify (default: 10)"
+    )
+    parser.add_argument(
+        "--analyze-token-ratio",
+        action="store_true",
+        help="Analyze text vs vision token ratio"
+    )
+    parser.add_argument(
+        "--ratio-samples",
+        type=int,
+        default=100,
+        help="Number of samples for token ratio analysis (default: 100)"
     )
     parser.add_argument(
         "--dataset",
@@ -444,6 +714,13 @@ def main():
             print()
             print("⚠️  Some samples had errors. Please review the output above.")
         
+        # Run padding quantization test
+        padding_test_passed = test_padding_quantization(
+            dataset_name="vqav2",
+            dataset_path=args.dataset,
+            num_batches=20,  # Test 20 batches to see variation
+        )
+        
         # Run collator test
         collator_test_passed = test_collator_integration(
             dataset_name="vqav2",
@@ -462,16 +739,32 @@ def main():
                 packing_buffer_size=args.packing_buffer_size,
             )
         
+        # Run token ratio analysis if requested
+        ratio_test_passed = True
+        if args.analyze_token_ratio:
+            print("\n")
+            ratio_test_passed = analyze_token_ratio(
+                dataset_name="vqav2",
+                dataset_path=args.dataset,
+                num_samples=args.ratio_samples,
+            )
+        
         # Overall result
         print("\n" + "=" * 60)
         print("OVERALL RESULT:")
         print(f"  Format test: {'✓ PASSED' if format_test_passed else '✗ FAILED'}")
+        print(f"  Padding quantization test: {'✓ PASSED' if padding_test_passed else '✗ FAILED'}")
         print(f"  Collator test: {'✓ PASSED' if collator_test_passed else '✗ FAILED'}")
         if args.test_packing:
             print(f"  Packing test: {'✓ PASSED' if packing_test_passed else '✗ FAILED'}")
+        if args.analyze_token_ratio:
+            print(f"  Token ratio analysis: {'✓ PASSED' if ratio_test_passed else '✗ FAILED'}")
         print("=" * 60)
         
-        if format_test_passed and collator_test_passed and packing_test_passed:
+        all_passed = (format_test_passed and padding_test_passed and 
+                     collator_test_passed and packing_test_passed and ratio_test_passed)
+        
+        if all_passed:
             print("\n🎉 All tests passed!")
             return 0
         else:
