@@ -15,16 +15,16 @@ to ensure consistency between online and offline preprocessing.
 """
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict
 
-import torch
 from tensordict import TensorDict
 from tqdm import tqdm
 from transformers import Qwen3VLProcessor
 
+from torchtitan.experiments.qwen3_vl.datasets.cached_vl_datasets import \
+    get_cache_key
 from torchtitan.experiments.qwen3_vl.datasets.vl_datasets import \
     HuggingFaceVLDataset
 from torchtitan.experiments.qwen3_vl.train_spec import \
@@ -55,17 +55,6 @@ def extract_tensordict_from_sample(sample: Dict[str, Any]) -> TensorDict:
     
     # Create TensorDict (handles tensors natively)
     return TensorDict(data, batch_size=[])
-
-
-def get_cache_key(
-    dataset_name: str,
-    seq_len: int,
-    buffer_size: int,
-    model_path: str,
-) -> str:
-    """Generate deterministic cache key from config."""
-    model_hash = hashlib.md5(model_path.encode()).hexdigest()[:8]
-    return f"{dataset_name}_seq{seq_len}_buf{buffer_size}_{model_hash}"
 
 
 def get_cache_dir(
@@ -110,7 +99,6 @@ def preprocess_and_cache(
     
     cache_file = cache_dir / "packed_samples.pt"
     metadata_file = cache_dir / "metadata.json"
-    stats_file = cache_dir / "stats.json"
     
     # Check if cache exists
     if not force and cache_file.exists():

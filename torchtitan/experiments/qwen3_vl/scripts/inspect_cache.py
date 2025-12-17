@@ -17,8 +17,8 @@ from pathlib import Path
 
 import torch
 
-from torchtitan.experiments.qwen3_vl.datasets.vl_datasets import \
-    PreprocessedVLDataset
+from torchtitan.experiments.qwen3_vl.datasets.cached_vl_datasets import \
+    CachedVLDataset
 
 # Configure logging
 logging.basicConfig(
@@ -40,8 +40,8 @@ def inspect_cache(cache_dir: str):
     logger.info(f"Inspecting cache: {cache_dir}")
     
     # Load dataset
-    logger.info("Loading PreprocessedVLDataset...")
-    dataset = PreprocessedVLDataset(
+    logger.info("Loading CachedVLDataset...")
+    dataset = CachedVLDataset(
         cache_dir=cache_dir,
         dp_rank=0,
         dp_world_size=1,
@@ -169,7 +169,7 @@ def inspect_cache(cache_dir: str):
         logger.warning("Some samples have different number of dimensions for the same field:")
         for key, dims in inconsistent_dims.items():
             logger.warning(f"  {key}: found {sorted(dims)} dimensions across samples")
-            logger.warning(f"    → This suggests batch dimension inconsistency!")
+            logger.warning("    → This suggests batch dimension inconsistency!")
     else:
         logger.info("✓ All samples have consistent tensor dimensions")
         for key, dims in sorted(tensor_dims.items()):

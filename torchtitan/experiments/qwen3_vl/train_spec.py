@@ -23,6 +23,8 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import build_validator
 from torchtitan.config import JobConfig
 from torchtitan.experiments.qwen3_vl import Qwen3VLModel, qwen3_vl_args
+from torchtitan.experiments.qwen3_vl.datasets.cached_vl_datasets import (
+    VL_CACHED_DATASETS, build_cached_vl_dataloader)
 from torchtitan.experiments.qwen3_vl.datasets.utils import (
     collate_vl_batch, preprocess_qwen_visual_pil)
 from torchtitan.experiments.qwen3_vl.datasets.vl_datasets import (
@@ -107,7 +109,26 @@ def build_qwen3vl_dataloader(
             infinite=True,
         )
     
-    # Route 2: Vision-language datasets (use VL-specific preprocessing)
+    # Route 2: Cached VL datasets (fast cache loading)
+    elif dataset_name in VL_CACHED_DATASETS:
+        logger.info(f"Using cached VL dataset: {dataset_name}")
+        
+        # Create collator with tokenizer captured in closure
+        def collator(instances):
+            return collate_vl_batch(instances, tokenizer)
+        
+        # Build dataloader using cached dataset
+        # Cache resolution happens inside build_cached_vl_dataloader
+        return build_cached_vl_dataloader(
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            collate_fn=collator,
+            dataset_name=dataset_name,
+            job_config=job_config,
+            infinite=True,
+        )
+    
+    # Route 3: Vision-language datasets (use VL-specific preprocessing)
     elif dataset_name in VL_DATASETS:
         logger.info(f"Using vision-language dataset: {dataset_name}")
         
@@ -126,12 +147,13 @@ def build_qwen3vl_dataloader(
             infinite=True,  # Loop dataset infinitely for training
         )
     
-    # Route 3: Unknown dataset
+    # Route 4: Unknown dataset
     else:
         raise ValueError(
             f"Unknown dataset: {dataset_name}. "
             f"Supported text datasets: {list(TEXT_DATASETS.keys())}. "
-            f"Supported VL datasets: {list(VL_DATASETS.keys())}"
+            f"Supported VL datasets: {list(VL_DATASETS.keys())}. "
+            f"Supported cached VL datasets: {list(VL_CACHED_DATASETS.keys())}"
         )
 
 

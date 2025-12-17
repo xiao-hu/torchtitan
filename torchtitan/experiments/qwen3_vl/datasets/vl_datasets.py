@@ -11,14 +11,11 @@ Follows the same pattern as text_datasets.py with DatasetConfig,
 but for multimodal (vision + text) data.
 """
 
-import json
 from functools import partial
-from pathlib import Path
 from typing import Any, Callable, Dict
 
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
-from tensordict import LazyStackedTensorDict, TensorDict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
@@ -125,7 +122,6 @@ VL_DATASETS = {
     # "nocaps": DatasetConfig(...),
     # etc.
 }
-
 
 def _validate_vl_dataset(
     dataset_name: str, dataset_path: str | None = None
@@ -335,82 +331,7 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
 
 
 # ============================================================================
-# Preprocessed Dataset Class
-# ============================================================================
-
-class PreprocessedVLDataset(IterableDataset, Stateful):
-    """
-    Load preprocessed and packed VL samples from TensorDict memmap cache.
-    
-    Much faster than HuggingFaceVLDataset since:
-    - No PIL decoding
-    - No tokenization
-    - No online packing
-    - Memory-mapped TensorDict (instant init, zero-copy, native tensors)
-    
-    TensorDict benefits:
-    - Native tensor storage (no conversion overhead)
-    - Memory-mapped format (instant loading)
-    - Simple sharding (just slice: td[rank::world_size])
-    - Zero-copy access
-    """
-    
-    def __init__(
-        self,
-        cache_dir: str,
-        dp_rank: int = 0,
-        dp_world_size: int = 1,
-        infinite: bool = False,
-    ):
-        cache_path = Path(cache_dir)
-        samples_dir = cache_path / "samples"
-        
-        # Load all samples using LazyStackedTensorDict (instant, seamless access!)
-        logger.info(f"Loading preprocessed samples from {samples_dir}...")
-        sample_paths = sorted(samples_dir.glob("sample_*"))
-        
-        if not sample_paths:
-            raise ValueError(f"No samples found in {samples_dir}")
-        
-        # Load each sample as memmap
-        samples = [TensorDict.load_memmap(str(path)) for path in sample_paths]
-        
-        # Stack lazily (no memory overhead, seamless indexing!)
-        full_dataset = LazyStackedTensorDict(*samples, stack_dim=0)
-        
-        # Apply DP sharding (simple slice!)
-        self.dataset = full_dataset[dp_rank::dp_world_size]
-        
-        logger.info(f"Loaded {len(full_dataset)} samples")
-        logger.info(f"DP shard: {len(self.dataset)} samples for rank {dp_rank}/{dp_world_size}")
-        logger.info("Format: LazyStackedTensorDict (memory-mapped, zero-copy, native tensors)")
-        
-        self.infinite = infinite
-        self._sample_idx = 0
-    
-    def __iter__(self):
-        while True:
-            for i in range(self._sample_idx, len(self.dataset)):
-                self._sample_idx = i + 1
-                # Return dict (TensorDict behaves like dict)
-                yield dict(self.dataset[i])  # Memory-mapped access - zero copy!
-            
-            if not self.infinite:
-                logger.info("Preprocessed dataset epoch complete")
-                break
-            else:
-                self._sample_idx = 0
-                logger.info("Preprocessed dataset restarting epoch")
-    
-    def load_state_dict(self, state_dict):
-        self._sample_idx = state_dict["sample_idx"]
-    
-    def state_dict(self):
-        return {"sample_idx": self._sample_idx}
-
-
-# ============================================================================
-# Dataloader Builder
+# Dataloader Builders
 # ============================================================================
 
 def build_vl_dataloader(
@@ -423,9 +344,10 @@ def build_vl_dataloader(
     infinite: bool = True,
 ) -> ParallelAwareDataloader:
     """
-    Build a data loader for Vision-Language datasets with optional sample packing.
+    Build a data loader for Vision-Language datasets with online sample packing.
     
-    Follows the proven pattern from mm_datasets.py.
+    Uses HuggingFaceVLDataset with online preprocessing and packing.
+    For cached datasets, use build_cached_vl_dataloader from cached_vl_datasets.py instead.
     
     Args:
         dp_world_size: Data parallel world size
@@ -463,11 +385,11 @@ def build_vl_dataloader(
         ...     job_config=job_config
         ... )
     """
+    batch_size = job_config.training.local_batch_size
     dataset_name = job_config.training.dataset
     dataset_path = job_config.training.dataset_path
-    batch_size = job_config.training.local_batch_size
     seq_len = job_config.training.seq_len
-
+    
     # Derive packing buffer size from seq_len
     # Logic: Assuming average VQA sample is ~400 tokens (question + answer + vision tokens)
     # - seq_len / 400 ≈ number of samples that fit in one packed sequence
@@ -475,9 +397,9 @@ def build_vl_dataloader(
     # - So: buffer_size = 10 * (seq_len / 400) = seq_len / 40
     # Example: seq_len=4096 → buffer_size ≈ 102 samples
     packing_buffer_size = max(50, seq_len // 40)
-    logger.info(f"Packing enabled with buffer_size={packing_buffer_size} (derived from seq_len={seq_len})")
-
-    hf_vl_ds = HuggingFaceVLDataset(
+    logger.info(f"Using HuggingFaceVLDataset with online packing (buffer_size={packing_buffer_size})")
+    
+    vl_ds = HuggingFaceVLDataset(
         dataset_name=dataset_name,
         dataset_path=dataset_path,
         processor=processor,
@@ -491,7 +413,7 @@ def build_vl_dataloader(
     )
 
     return ParallelAwareDataloader(
-        dataset=hf_vl_ds,
+        dataset=vl_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         batch_size=batch_size,

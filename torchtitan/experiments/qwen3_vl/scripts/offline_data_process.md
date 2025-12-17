@@ -115,7 +115,7 @@ cache_key = f"{dataset}_{split}_seq{seq_len}_buf{buffer}_model{hash}"
 
 #### 1.1 Create Preprocessing Script
 
-**File**: `torchtitan/experiments/qwen3_vl/datasets/preprocess_cached.py`
+**File**: `torchtitan/experiments/qwen3_vl/scripts/preprocess_cached.py`
 
 **Functions**:
 - `get_cache_key()` - Generate deterministic cache identifier
@@ -129,7 +129,11 @@ cache_key = f"{dataset}_{split}_seq{seq_len}_buf{buffer}_model{hash}"
 
 **CLI Interface**:
 ```bash
+# pack the dataset
 python -m torchtitan.experiments.qwen3_vl.datasets.preprocess_cached   --dataset vqav2  --seq-len 8192   --buffer-size 64   --model-path /checkpoints/xxie-sandbox/Qwen/Qwen3-VL-30B-A3B-Instruct   --cache-dir /checkpoints/xxie-sandbox/preprocessed_cache --max-samples 2048
+
+# inspect after 
+python -m torchtitan.experiments.qwen3_vl.scripts.inspect_cache --cache-dir /data/xxie-sandbox/preprocessed_cache_td/vqav2_seq8192_buf64_08cc5770/
 ```
 
 
@@ -137,7 +141,7 @@ python -m torchtitan.experiments.qwen3_vl.datasets.preprocess_cached   --dataset
 
 **File**: `torchtitan/experiments/qwen3_vl/datasets/vl_datasets.py` (extend existing)
 
-**Class**: `PreprocessedVLDataset(IterableDataset, Stateful)`
+**Class**: `CachedVLDataset(IterableDataset, Stateful)`
 
 **Features**:
 - Load preprocessed samples from cache
@@ -168,7 +172,7 @@ def build_vl_dataloader(...):
     # 2. Check if cache exists
     if use_cache and cache_exists:
         # Use fast cached dataset!
-        dataset = PreprocessedVLDataset(cache_dir, ...)
+        dataset = CachedVLDataset(cache_dir, ...)
     else:
         # Fall back to online preprocessing
         logger.warning("Cache not found, using online preprocessing (slow!)")

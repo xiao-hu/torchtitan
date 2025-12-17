@@ -16,6 +16,7 @@ This implementation extends the base SamplePacker with VL-specific field handlin
 from typing import Any, Dict, List
 
 import torch
+
 from torchtitan.experiments.vlm.datasets.utils.packing import SamplePacker
 
 

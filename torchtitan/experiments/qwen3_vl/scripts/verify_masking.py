@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Test to verify the masking logic correctly masks only assistant turns."""
 
+import numpy as np
+# Create a test sample with user question and assistant answer
+from PIL import Image
 from transformers import Qwen3VLProcessor
 
 from torchtitan.experiments.qwen3_vl.train_spec import \
@@ -17,10 +20,6 @@ print(f'<|im_start|>: {processor.tokenizer.encode("<|im_start|>", add_special_to
 print(f'user: {processor.tokenizer.encode("user", add_special_tokens=False)}')
 print(f'assistant: {processor.tokenizer.encode("assistant", add_special_tokens=False)}')
 print(f'<|im_end|>: {processor.tokenizer.encode("<|im_end|>", add_special_tokens=False)}')
-
-import numpy as np
-# Create a test sample with user question and assistant answer
-from PIL import Image
 
 # Create dummy image
 img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
@@ -58,7 +57,7 @@ for i, (token_id, label) in enumerate(zip(input_ids, labels)):
     print(f"{i:4d}: {status} | Token ID: {token_id:6d} | Text: {repr(token_text)}")
 
 # Count masked vs unmasked tokens
-num_masked = sum(1 for l in labels if l == IGNORE_INDEX)
+num_masked = sum(1 for lb in labels if lb == IGNORE_INDEX)
 num_unmasked = len(labels) - num_masked
 
 print("\n" + "=" * 80)
