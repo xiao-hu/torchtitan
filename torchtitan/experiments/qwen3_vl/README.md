@@ -382,10 +382,17 @@ VL_DATASETS["coco_caption"] = DatasetConfig(
 
 #### Supported Datasets
 
-**Currently Implemented:**
+**Vision-Language Datasets:**
 - ✅ **VQAv2** - Visual Question Answering (443K training images)
   - Path: `HuggingFaceM4/VQAv2`
   - Splits: `train`, `validation`
+
+**Text-Only Datasets:**
+- ✅ **C4** - Colossal Clean Crawled Corpus (180B tokens)
+  - Path: `allenai/c4`
+  - Splits: `train`, `validation`
+  - Uses existing TorchTitan text infrastructure
+  - Automatically routed via `train_spec.py`
 
 **Easy to Add** (just write formatter function):
 - COCO Captions - Image captioning (123K images)
@@ -418,6 +425,8 @@ Batches produced by the dataloader:
 ```
 
 #### Dataset Configuration
+
+**Vision-Language Training:**
 ```toml
 [training]
 dataset = "vqav2"
@@ -430,6 +439,23 @@ patch_size = 14
 spatial_merge_size = 2
 packing_buffer_size = 0  # Sample packing: 0=disabled, 100=enabled (recommended)
 ```
+
+**Text-Only Training:**
+```toml
+[training]
+dataset = "c4"  # Automatically uses HuggingFaceTextDataset
+dataset_path = "allenai/c4"  # optional override
+local_batch_size = 8  # Higher batch size possible (no vision processing)
+seq_len = 12288
+
+# No vision parameters needed!
+```
+
+**Automatic Dataset Type Detection:**
+The dataloader builder (`build_qwen3vl_dataloader` in `train_spec.py`) automatically detects whether a dataset is text-only or vision-language based on the dataset name:
+- If `dataset` is in `TEXT_DATASETS` → Uses `HuggingFaceTextDataset` (text-only)
+- If `dataset` is in `VL_DATASETS` → Uses `HuggingFaceVLDataset` (vision-language)
+- Otherwise → Raises error with supported datasets list
 
 ### Phase 7: Training Configuration & TrainSpec Integration ✅ COMPLETE
 **Goal**: Enable Qwen3-VL training through TorchTitan's standard training loop
@@ -612,8 +638,13 @@ By delegating language model parallelization to `parallelize_qwen3`, we get:
 ### Phase 10: Optimization
 
 - [x] Sample packing
-- [x] Comile
-- [ ] Optimize data loading workers
+- [x] Compile
+- [x] **Text-Only Dataset Support** - Train Qwen3-VL on pure text (no vision)
+- [ ] **Offline Data Preprocessing** (see [offline_data_process.md](datasets/offline_data_process.md))
+  - 3-4x faster training (0.2s vs 0.6s per step)
+  - 80-85% GPU utilization (vs 50-70%)
+  - One-time preprocessing cost: 4-6 hours
+  - Benefits all subsequent training runs
 - [ ] Profile with `torch.profiler`
 - [ ] Implement dynamic padding collator
 - [ ] Experiment with batch_size=2,4,8
@@ -627,6 +658,11 @@ By delegating language model parallelization to `parallelize_qwen3`, we get:
 - **Sample Packing**: 30-50% speedup, enabled by default
 - **Hybrid Parallelization**: Vision (FSDP2) + Language (TP/EP/CP/FSDP)
 - **Selective AC**: Activation checkpointing for memory efficiency
+- **Text-Only Training**: Full text dataset support (C4, etc.) with automatic routing
+  - Reuses existing `HuggingFaceTextDataset` infrastructure
+  - Zero code duplication (~30 lines of routing logic)
+  - Higher batch sizes possible (8-12 vs 1-4 for VL)
+  - Faster preprocessing (10ms vs 200ms per sample)
 
 #### Optimization Priority
 1. **Enable Torch Compile**

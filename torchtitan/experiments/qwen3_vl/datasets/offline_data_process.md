@@ -29,12 +29,14 @@ MFU: 30-45%
 ```
 
 **Root Causes**:
-1. **PIL Image Decoding**: 60-100ms per step (204 images × ~0.3-0.5ms each)
-2. **Sample Packing**: 50-80ms per step (processing 204 samples, sorting, padding)
+1. **PIL Image Decoding**: 60-100ms per step (~200 images per packed batch)
+2. **Sample Packing**: 50-80ms per step (processing ~200 samples, sorting, padding)
 3. **Torch.compile Warmup**: 20-40 steps due to variable packed sequence lengths
 4. **Tokenization**: 10-20ms per step (text processing)
 
 **Total CPU overhead**: 120-200ms per step (GPU only needs 100-150ms!)
+
+**Note**: Offline preprocessing takes ~1.7s per packed sample (measured)
 
 ### Why Workers Don't Help
 
@@ -60,12 +62,15 @@ MFU: 30-45%
 │     - Tokenize text                                             │
 │     - Process vision features                                   │
 │  3. Pack samples (buffer_size=75)                               │
-│  4. Save to cache:                                              │
+│  4. Save each sample individually as TensorDict memmap:         │
 │     /checkpoints/xxie-sandbox/preprocessed_cache/               │
 │       vqav2_validation_seq8192_buf75_<hash>/                    │
-│         ├── packed_samples.pt    (main data)                   │
+│         ├── samples/                                            │
+│         │   ├── sample_000001/  (TensorDict memmap)            │
+│         │   ├── sample_000002/  (TensorDict memmap)            │
+│         │   └── ...                                             │
 │         ├── metadata.json        (config)                      │
-│         └── stats.json           (packing stats)               │
+│         └── packing_stats.json   (packing stats)               │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -73,14 +78,15 @@ MFU: 30-45%
 │  (Every run, instant startup)                                   │
 │                                                                  │
 │  1. Check if cache exists for config                            │
-│  2. Load preprocessed tensors (< 1 second)                      │
-│  3. Start training immediately:                                 │
+│  2. Load with LazyStackedTensorDict (instant, memory-mapped!)   │
+│  3. DP shard: dataset[rank::world_size]                         │
+│  4. Start training immediately:                                 │
 │     - No PIL decoding                                           │
 │     - No tokenization                                           │
 │     - No packing                                                │
-│     - Fixed sequence lengths                                    │
-│  4. GPU Utilization: 80-85%                                     │
-│  5. Step Time: 0.2-0.3s                                        │
+│     - Variable sequence lengths (natural!)                      │
+│  5. GPU Utilization: 80-85%                                     │
+│  6. Step Time: 0.2-0.3s                                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

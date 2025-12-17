@@ -24,11 +24,15 @@ from torchtitan.config import JobConfig
 from torchtitan.experiments.qwen3_vl import Qwen3VLModel, qwen3_vl_args
 from torchtitan.experiments.qwen3_vl.datasets import (
     DataCollatorForSupervisedDataset, build_vl_dataloader)
+from torchtitan.experiments.qwen3_vl.datasets.vl_datasets import VL_DATASETS
 from torchtitan.experiments.qwen3_vl.infra.parallelize import \
     parallelize_qwen3_vl
 from torchtitan.experiments.qwen3_vl.model.model import get_rope_index
 from torchtitan.experiments.qwen3_vl.model.state_dict_adapter import \
     Qwen3VLStateDictAdapter
+from torchtitan.hf_datasets.text_datasets import DATASETS as TEXT_DATASETS
+from torchtitan.hf_datasets.text_datasets import build_text_dataloader
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.protocols.train_spec import TrainSpec
 
 
@@ -99,26 +103,18 @@ def preprocess_qwen_visual_pil(sources, processor):
         return_tensors="pt",
     )
     
-    # Ensure correct dtypes and shapes
-    input_ids = full_result["input_ids"].long()  # Must be Long for embedding
-    if isinstance(input_ids, list):
-        input_ids = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+    # Work with batch dimension throughout, squeeze everything at the end
+    # Processor returns tensors with batch dimension since we pass text=[text]
     
-    # Ensure pixel_values has correct shape (add batch dim if missing)
-    if "pixel_values" in full_result and full_result["pixel_values"] is not None:
-        pixel_values = full_result["pixel_values"]
-        if pixel_values.dim() == 2:
-            # Missing batch dim - add it
-            pixel_values = pixel_values.unsqueeze(0)
-        full_result["pixel_values"] = pixel_values
+    # Ensure correct dtypes
+    input_ids = full_result["input_ids"].long()  # [1, seq]
     
-    # Ensure image_grid_thw has correct dtype
-    # Processor always returns [num_images, 3] for image_grid_thw
+    # Ensure image_grid_thw has correct dtype (already [num_images, 3], no batch dim)
     if "image_grid_thw" in full_result and full_result["image_grid_thw"] is not None:
         full_result["image_grid_thw"] = full_result["image_grid_thw"].long()
     
     # Create labels (mask everything except assistant responses)
-    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    labels = torch.full_like(input_ids, IGNORE_INDEX)  # [1, seq]
     
     # Find assistant response tokens (between <|im_start|>assistant and <|im_end|>)
     # Token IDs: <|im_start|>=151644, user=872, assistant=77091, <|im_end|>=151645, \n=198
@@ -129,8 +125,6 @@ def preprocess_qwen_visual_pil(sources, processor):
         # Look for <|im_start|> followed by assistant
         if input_ids_flat[pos] == 151644 and input_ids_flat[pos + 1] == 77091:
             # Found assistant turn
-            # The chat template adds '\n' after '<|im_start|>assistant' as part of generation prompt
-            # So we should unmask from AFTER the newline (what model actually generates)
             ans_start = pos + 2  # Skip <|im_start|> and "assistant"
             
             # Skip the newline if present (it's part of the template prompt, not model output)
@@ -147,49 +141,57 @@ def preprocess_qwen_visual_pil(sources, processor):
                 pos = ans_end
         pos += 1
     
-    full_result["labels"] = labels
-    full_result["input_ids"] = input_ids
-    
-    # Calculate position_ids for 3D RoPE (required by collator)
-    # This is done during data loading for efficiency (computed once, reused across epochs)
+    # Calculate position_ids for 3D RoPE
     position_ids, _ = get_rope_index(
-        input_ids=input_ids,
-        image_grid_thw=full_result.get("image_grid_thw"),  # Already normalized above
+        input_ids=input_ids,  # [1, seq]
+        image_grid_thw=full_result.get("image_grid_thw"),
         video_grid_thw=full_result.get("video_grid_thw"),
-        attention_mask=None,  # Will be computed from input_ids
-        spatial_merge_size=2,  # Default from model config
+        attention_mask=None,
+        spatial_merge_size=2,
         image_token_id=151655,
         video_token_id=151656,
         vision_start_token_id=151652,
-    )
-    full_result["position_ids"] = position_ids
+    )  # Returns [3, 1, seq]
+    
+    # Keep batch dimensions - packer will handle squeezing uniformly
+    full_result["input_ids"] = input_ids  # Keep [1, seq]
+    full_result["labels"] = labels        # Keep [1, seq]
+    full_result["position_ids"] = position_ids  # Keep [3, 1, seq]
     
     return full_result
 
 
 def build_qwen3vl_tokenizer(job_config: JobConfig):
     """
-    Load Qwen3-VL processor (tokenizer + image processor).
+    Load appropriate tokenizer based on dataset type.
     
-    Note: Returns Qwen3VLProcessor (not just tokenizer) which includes:
-    - tokenizer: For text processing
-    - image_processor: For vision input processing
+    For text-only datasets (c4, pile, etc.):
+        Returns HuggingFaceTokenizer with encode(text, add_bos, add_eos) interface
+        
+    For vision-language datasets (vqav2, etc.):
+        Returns Qwen3VLProcessor (tokenizer + image processor)
     
     Args:
         job_config: TorchTitan job configuration
         
     Returns:
-        Qwen3VLProcessor instance
+        HuggingFaceTokenizer or Qwen3VLProcessor depending on dataset
     """
-    processor = Qwen3VLProcessor.from_pretrained(
-        job_config.model.hf_assets_path,
-        trust_remote_code=True,
-    )
+    dataset_name = job_config.training.dataset.lower()
     
-    # Ensure padding side is correct for training
-    processor.tokenizer.padding_side = "right"
+    # Text-only datasets: use HuggingFaceTokenizer
+    if dataset_name in TEXT_DATASETS:
+        return HuggingFaceTokenizer(job_config.model.hf_assets_path)
     
-    return processor
+    # Vision-language datasets: use Qwen3VLProcessor
+    else:
+        processor = Qwen3VLProcessor.from_pretrained(
+            job_config.model.hf_assets_path,
+            trust_remote_code=True,
+        )
+        # Ensure padding side is correct for training
+        processor.tokenizer.padding_side = "right"
+        return processor
 
 
 def build_qwen3vl_dataloader(
@@ -199,52 +201,78 @@ def build_qwen3vl_dataloader(
     job_config: JobConfig,
 ):
     """
-    Build VL dataloader with Qwen3-VL specific preprocessing.
+    Build dataloader with auto-detection for text-only vs vision-language datasets.
     
-    This function encapsulates:
-    - Processor (tokenizer + image processor)
-    - Model-specific preprocessing (preprocess_qwen_visual)
-    - Collator for batching (DataCollatorForSupervisedDataset)
+    Supports:
+    - Text-only datasets (c4, pile, etc.) → Uses HuggingFaceTextDataset
+    - Vision-language datasets (vqav2, etc.) → Uses HuggingFaceVLDataset
     
     Args:
         dp_world_size: Data parallel world size
         dp_rank: Data parallel rank
-        tokenizer: Qwen3VLProcessor (not just tokenizer!)
+        tokenizer: Qwen3VLProcessor (includes tokenizer + image processor)
         job_config: TorchTitan job configuration
         
     Returns:
-        ParallelAwareDataloader with VL-specific components
+        ParallelAwareDataloader with appropriate preprocessing
     """
-
-    # Create base collator
-    base_collator = DataCollatorForSupervisedDataset(
-        tokenizer=tokenizer.tokenizer
-    )
+    from torchtitan.tools.logging import logger
     
-    # Wrap collator to match TorchTitan's expected format: (input_dict, labels)
-    def collator(instances):
-        """
-        Wrapper that adapts Qwen3-VL collator output to TorchTitan format.
+    dataset_name = job_config.training.dataset.lower()
+    
+    # Route 1: Text-only datasets (reuse existing text infrastructure)
+    if dataset_name in TEXT_DATASETS:
+        logger.info(f"Using text-only dataset: {dataset_name}")
+        # tokenizer is already HuggingFaceTokenizer from build_qwen3vl_tokenizer
+        return build_text_dataloader(
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            tokenizer=tokenizer,
+            job_config=job_config,
+            infinite=True,
+        )
+    
+    # Route 2: Vision-language datasets (use VL-specific preprocessing)
+    elif dataset_name in VL_DATASETS:
+        logger.info(f"Using vision-language dataset: {dataset_name}")
         
-        Qwen3-VL collator returns: dict with labels inside
-        TorchTitan expects: tuple of (input_dict, labels)
-        """
-        batch = base_collator(instances)
-        # Extract labels and rename input_ids to input
-        labels = batch.pop("labels")
-        batch["input"] = batch.pop("input_ids")
-        return batch, labels
+        # Create base collator
+        base_collator = DataCollatorForSupervisedDataset(
+            tokenizer=tokenizer.tokenizer
+        )
+        
+        # Wrap collator to match TorchTitan's expected format: (input_dict, labels)
+        def collator(instances):
+            """
+            Wrapper that adapts Qwen3-VL collator output to TorchTitan format.
+            
+            Qwen3-VL collator returns: dict with labels inside
+            TorchTitan expects: tuple of (input_dict, labels)
+            """
+            batch = base_collator(instances)
+            # Extract labels and rename input_ids to input
+            labels = batch.pop("labels")
+            batch["input"] = batch.pop("input_ids")
+            return batch, labels
+        
+        # Build dataloader with model-specific preprocessing
+        return build_vl_dataloader(
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            processor=tokenizer,
+            preprocess_fn=preprocess_qwen_visual_pil,
+            collate_fn=collator,
+            job_config=job_config,
+            infinite=True,  # Loop dataset infinitely for training
+        )
     
-    # Build dataloader with model-specific preprocessing
-    return build_vl_dataloader(
-        dp_world_size=dp_world_size,
-        dp_rank=dp_rank,
-        processor=tokenizer,
-        preprocess_fn=preprocess_qwen_visual_pil,
-        collate_fn=collator,
-        job_config=job_config,
-        infinite=True,  # Loop dataset infinitely for training
-    )
+    # Route 3: Unknown dataset
+    else:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. "
+            f"Supported text datasets: {list(TEXT_DATASETS.keys())}. "
+            f"Supported VL datasets: {list(VL_DATASETS.keys())}"
+        )
 
 
 # Define TrainSpec for Qwen3-VL

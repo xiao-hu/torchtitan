@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
+from tensordict import TensorDict
 from tqdm import tqdm
 from transformers import Qwen3VLProcessor
 
@@ -31,35 +32,29 @@ from torchtitan.experiments.qwen3_vl.train_spec import \
 from torchtitan.tools.logging import logger
 
 
-def save_as_pure_tensors(sample: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+def extract_tensordict_from_sample(sample: Dict[str, Any]) -> TensorDict:
     """
-    Convert BatchFeature or dict with mixed types to pure tensor dict.
+    Extract TensorDict from BatchFeature sample.
     
-    This extracts only tensor data, discarding BatchFeature wrapper class.
-    Allows saving with weights_only=True for faster/safer loading.
+    TensorDict natively supports PyTorch tensors with efficient storage.
+    No conversion needed - direct tensor storage!
     
     Args:
         sample: BatchFeature or dict containing tensors
         
     Returns:
-        Dict with only tensor fields
+        TensorDict with all tensor fields
     """
-    pure_dict = {}
+    # Extract base dict
+    if hasattr(sample, 'data'):
+        data = dict(sample.data)
+    elif isinstance(sample, dict):
+        data = sample
+    else:
+        data = dict(sample)
     
-    # Standard fields we expect
-    tensor_keys = ['input_ids', 'labels', 'pixel_values', 'image_grid_thw', 'position_ids', 'attention_mask']
-    
-    for key in tensor_keys:
-        if key in sample:
-            value = sample[key]
-            # Convert to tensor if not already
-            if torch.is_tensor(value):
-                pure_dict[key] = value
-            elif value is not None:
-                # Some fields might be lists or numpy arrays
-                pure_dict[key] = torch.tensor(value)
-    
-    return pure_dict
+    # Create TensorDict (handles tensors natively)
+    return TensorDict(data, batch_size=[])
 
 
 def get_cache_key(
@@ -144,37 +139,29 @@ def preprocess_and_cache(
         infinite=False,  # Single pass through dataset
     )
     
-    # Collect preprocessed samples with periodic flushing to avoid OOM
-    packed_samples = []
+    # Process samples incrementally - save each individually (variable lengths!)
     sample_count = 0
-    total_packed_count = 0  # Track total packed samples as we go
     error_count = 0
-    save_interval = 64  # Save every 64 packed samples (~10GB per chunk with vision data)
-    chunk_files = []
-    chunk_sizes = []  # Track size of each chunk for fast loading
+    
+    # Create samples directory
+    samples_dir = cache_dir / "samples"
+    samples_dir.mkdir(exist_ok=True)
     
     # Calculate total for progress bar
     total_samples = max_samples if max_samples else len(vl_dataset._data)
     logger.info(f"Processing {total_samples} samples with packing (buffer_size={buffer_size})...")
-    logger.info(f"Using periodic saving every {save_interval} samples (~{save_interval * 150}MB per chunk)")
+    logger.info("Saving each sample individually (variable lengths preserved)")
+    logger.info("Output: LazyStackedTensorDict (memory-mapped, instant loading, native tensors)")
     
     try:
         for sample in tqdm(vl_dataset, desc="Preprocessing", total=total_samples, unit="samples"):
-            # Convert to pure tensors immediately to save memory
-            pure_sample = save_as_pure_tensors(sample)
-            packed_samples.append(pure_sample)
+            # Extract TensorDict (no conversion needed!)
+            td = extract_tensordict_from_sample(sample)
             sample_count += 1
             
-            # Periodically save to disk to free memory
-            if len(packed_samples) >= save_interval:
-                chunk_file = cache_dir / f"chunk_{len(chunk_files):04d}.pt"
-                chunk_size = len(packed_samples)
-                torch.save(packed_samples, chunk_file, _use_new_zipfile_serialization=True)
-                chunk_files.append(chunk_file)
-                chunk_sizes.append(chunk_size)
-                total_packed_count += chunk_size
-                logger.info(f"Saved chunk {len(chunk_files)} with {chunk_size} samples (pure tensors)")
-                packed_samples = []  # Free memory
+            # Save each sample individually (variable lengths!)
+            sample_path = samples_dir / f"sample_{sample_count:06d}"
+            td.memmap_(sample_path)
             
             # Stop if max_samples reached
             if max_samples and sample_count >= max_samples:
@@ -187,53 +174,43 @@ def preprocess_and_cache(
     
     error_count = vl_dataset.error_count
     
-    # Save any remaining samples
-    if packed_samples:
-        chunk_file = cache_dir / f"chunk_{len(chunk_files):04d}.pt"
-        chunk_size = len(packed_samples)
-        torch.save(packed_samples, chunk_file, _use_new_zipfile_serialization=True)
-        chunk_files.append(chunk_file)
-        chunk_sizes.append(chunk_size)
-        total_packed_count += chunk_size
-        logger.info(f"Saved final chunk with {chunk_size} samples (pure tensors)")
     
     # Get packing stats
     packing_stats = {}
     if hasattr(vl_dataset, 'packer'):
         packing_stats = vl_dataset.packer.get_stats()
     
-    # No merge needed - PreprocessedVLDataset will load chunks lazily
-    logger.info(f"Preprocessing complete! Saved {len(chunk_files)} chunk files")
-    logger.info(f"Total packed samples: {total_packed_count}")
+    logger.info(f"✓ Saved {sample_count} samples individually")
+    logger.info(f"  Samples in: {samples_dir}")
+    logger.info("  Use LazyStackedTensorDict at load time for seamless access")
     
-    # Save metadata with chunk file list and sizes
+    # Save metadata
     metadata = {
         "dataset_name": dataset_name,
-        "model_path": model_path,
         "seq_len": seq_len,
         "buffer_size": buffer_size,
-        "batch_size": batch_size,
-        "num_packed_samples": total_packed_count,
-        "num_chunks": len(chunk_files),
-        "chunk_files": [f.name for f in chunk_files],  # Store relative names
-        "chunk_sizes": chunk_sizes,  # Store chunk sizes for fast loading
+        "num_samples": sample_count,
         "error_count": error_count,
-        "cache_key": get_cache_key(dataset_name, seq_len, buffer_size, model_path),
+        "format": "lazystacked_tensordict",
+        "packing_efficiency": packing_stats.get('avg_samples_per_pack', 0),
     }
     
-    with open(metadata_file, "w") as f:
+    with open(cache_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
     
     # Save packing stats
-    with open(stats_file, "w") as f:
+    with open(cache_dir / "packing_stats.json", "w") as f:
         json.dump(packing_stats, f, indent=2)
     
+    logger.info("\n" + "="*60)
     logger.info("✓ Preprocessing complete!")
-    logger.info(f"  - Packed samples: {total_packed_count}")
-    logger.info(f"  - Chunk files: {len(chunk_files)}")
-    logger.info(f"  - Errors: {error_count}")
-    logger.info(f"  - Packing efficiency: {packing_stats.get('avg_samples_per_pack', 0):.2f} samples/pack")
-    logger.info(f"  - Cache: {cache_dir}")
+    logger.info("="*60)
+    logger.info(f"Packed samples: {sample_count}")
+    logger.info(f"Packing efficiency: {packing_stats.get('avg_samples_per_pack', 0):.2f} samples/pack")
+    logger.info(f"Errors: {error_count}")
+    logger.info(f"Samples location: {samples_dir}")
+    logger.info("Format: LazyStackedTensorDict (memory-mapped, instant loading, native tensors)")
+    logger.info("="*60)
     
     return metadata
 

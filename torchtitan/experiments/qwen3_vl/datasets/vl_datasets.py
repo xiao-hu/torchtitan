@@ -16,9 +16,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-import torch
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
+from tensordict import LazyStackedTensorDict, TensorDict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
@@ -332,15 +332,19 @@ class HuggingFaceVLDataset(IterableDataset, Stateful):
 
 class PreprocessedVLDataset(IterableDataset, Stateful):
     """
-    Load preprocessed and packed VL samples from cache.
-    
-    Uses chunked format with lazy loading to avoid OOM.
+    Load preprocessed and packed VL samples from TensorDict memmap cache.
     
     Much faster than HuggingFaceVLDataset since:
     - No PIL decoding
     - No tokenization
     - No online packing
-    - Just direct tensor loading
+    - Memory-mapped TensorDict (instant init, zero-copy, native tensors)
+    
+    TensorDict benefits:
+    - Native tensor storage (no conversion overhead)
+    - Memory-mapped format (instant loading)
+    - Simple sharding (just slice: td[rank::world_size])
+    - Zero-copy access
     """
     
     def __init__(
@@ -351,54 +355,37 @@ class PreprocessedVLDataset(IterableDataset, Stateful):
         infinite: bool = False,
     ):
         cache_path = Path(cache_dir)
+        samples_dir = cache_path / "samples"
         
-        # Load metadata
-        with open(cache_path / "metadata.json") as f:
-            self.metadata = json.load(f)
+        # Load all samples using LazyStackedTensorDict (instant, seamless access!)
+        logger.info(f"Loading preprocessed samples from {samples_dir}...")
+        sample_paths = sorted(samples_dir.glob("sample_*"))
         
-        self.cache_dir = cache_path
-        self.dp_rank = dp_rank
-        self.dp_world_size = dp_world_size
+        if not sample_paths:
+            raise ValueError(f"No samples found in {samples_dir}")
+        
+        # Load each sample as memmap
+        samples = [TensorDict.load_memmap(str(path)) for path in sample_paths]
+        
+        # Stack lazily (no memory overhead, seamless indexing!)
+        full_dataset = LazyStackedTensorDict(*samples, stack_dim=0)
+        
+        # Apply DP sharding (simple slice!)
+        self.dataset = full_dataset[dp_rank::dp_world_size]
+        
+        logger.info(f"Loaded {len(full_dataset)} samples")
+        logger.info(f"DP shard: {len(self.dataset)} samples for rank {dp_rank}/{dp_world_size}")
+        logger.info("Format: LazyStackedTensorDict (memory-mapped, zero-copy, native tensors)")
+        
         self.infinite = infinite
-        
-        # Load chunked format
-        self.chunk_files = [cache_path / name for name in self.metadata["chunk_files"]]
-        self.num_samples = self.metadata["num_packed_samples"]
-        chunk_sizes = self.metadata["chunk_sizes"]
-        logger.info(f"Using chunked cache: {len(self.chunk_files)} chunks, {self.num_samples} total samples")
-        
-        # Build chunk index from metadata (fast - no loading needed!)
-        self.chunk_ranges = []
-        start_idx = 0
-        for chunk_file, chunk_size in zip(self.chunk_files, chunk_sizes):
-            self.chunk_ranges.append((start_idx, start_idx + chunk_size, chunk_file))
-            start_idx += chunk_size
-        
-        # Compute this rank's sample indices
-        self.rank_sample_indices = list(range(dp_rank, self.num_samples, dp_world_size))
-        logger.info(f"Rank {dp_rank}/{dp_world_size} has {len(self.rank_sample_indices)} samples")
-        
-        # State for checkpointing
         self._sample_idx = 0
-    
-    def _get_sample_from_chunks(self, global_idx: int):
-        """Load a specific sample from chunked storage."""
-        # Find which chunk contains this sample
-        for start, end, chunk_file in self.chunk_ranges:
-            if start <= global_idx < end:
-                # Load chunk and extract sample (pure tensors, safe with weights_only=True)
-                chunk = torch.load(chunk_file, weights_only=True)
-                local_idx = global_idx - start
-                return chunk[local_idx]
-        raise IndexError(f"Sample index {global_idx} out of range")
     
     def __iter__(self):
         while True:
-            # Load samples on demand from chunks
-            for i in range(self._sample_idx, len(self.rank_sample_indices)):
+            for i in range(self._sample_idx, len(self.dataset)):
                 self._sample_idx = i + 1
-                global_idx = self.rank_sample_indices[i]
-                yield self._get_sample_from_chunks(global_idx)
+                # Return dict (TensorDict behaves like dict)
+                yield dict(self.dataset[i])  # Memory-mapped access - zero copy!
             
             if not self.infinite:
                 logger.info("Preprocessed dataset epoch complete")
