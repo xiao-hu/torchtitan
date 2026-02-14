@@ -1,0 +1,82 @@
+# NOTE: this toml config is a preset for 8 H200 GPUs (with 141GiB memory).
+
+[job]
+dump_folder = "/checkpoints/xxie-sandbox/titan/output/qwen3-30b/"
+description = "Qwen3 30B-A3B MOE training"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 10
+enable_tensorboard = false
+save_tb_folder = "tb"
+
+[model]
+name = "qwen3"
+flavor = "30B-A3B"
+hf_assets_path = "/checkpoints/xxie-sandbox/Qwen/Qwen3-30B-A3B-Instruct-2507"
+# Float8 converters - use full registry names
+# converters = ["quantize.linear.float8", "quantize.grouped_mm.float8"]
+
+[optimizer]
+name = "AdamW"
+lr = 8e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 600  # lr scheduler warm up, 20% total steps
+
+[training]
+local_batch_size = 4
+seq_len = 12288  # Increased from 4096 for better efficiency
+max_norm = 1.0  # grad norm clipping
+steps = 3000
+dataset = "c4"
+
+[parallelism]
+# Data Parallelism configuration:
+# - data_parallel_replicate_degree: Degree of weight replication (DDP-style)
+#   When > 1: uses DDP (weights replicated across ranks)
+#   When = 1: no replication (default)
+data_parallel_replicate_degree = 1  # No DDP replication
+
+# - data_parallel_shard_degree: Degree of weight sharding (FSDP-style)
+#   When > 1: weights are sharded across ranks using FSDP
+#   When = -1: auto-calculated from leftover ranks (after TP/EP/PP allocation)
+#   When = 1: disabled (no sharding)
+# - If both replicate > 1 and shard > 1: uses HSDP (Hybrid Sharded Data Parallelism)
+data_parallel_shard_degree = -1  # Auto FSDP: uses remaining ranks after TP/EP
+
+fsdp_reshard_after_forward = "default" # default / never / always
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+# Expert parallelism for MoE models
+expert_parallel_degree = 4  # Megatron: expert_model_parallel_size
+expert_tensor_parallel_degree = 1  # Megatron: expert_tensor_parallel_size
+
+[checkpoint]
+enable = false
+folder = "checkpoint" # subfolder under dump_folder to save checkpoints
+interval = 500
+last_save_model_only = false
+export_dtype = "float16"
+async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
+
+[activation_checkpoint]
+mode = "selective"  # ["none", "selective", "full"]
+selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
+
+[compile]
+enable=true  # Enable compilation for 10-30% performance improvement
+components = ["model", "loss"]
+
+[quantize.linear.float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]
+
+# [quantize.grouped_mm.float8]
+# fqns = ["experts"]
