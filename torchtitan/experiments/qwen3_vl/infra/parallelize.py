@@ -35,8 +35,6 @@ def parallelize_qwen3_vl(
     - Language model: Delegate to parallelize_qwen3 (works because Qwen3VLTextModel extends Qwen3Model)
     - Optimization: Create dp_mesh once and share between vision and language models
     """
-    world_mesh = parallel_dims.world_mesh
-
     mp_policy = MixedPrecisionPolicy(
         param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
@@ -47,16 +45,10 @@ def parallelize_qwen3_vl(
     # ========================================================================
     dp_mesh = None
     if parallel_dims.fsdp_enabled:
-        if parallel_dims.dp_replicate_enabled:
-            # HSDP case: Need both dp_replicate and dp_shard_cp dimensions
-            # No pre-flattened mesh exists for this combination
-            # Must use tuple slicing (triggers deprecation warning until PT 2.11)
-            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
-            dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
-        else:
-            # Standard FSDP: Use pre-flattened mesh (warning-free)
-            # This mesh was created during build_mesh() with _flatten()
-            dp_mesh = world_mesh["dp_shard_cp"]
+        dp_mesh_names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+        )
+        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
 
     # ========================================================================
     # STEP 1: Vision Encoder - Comprehensive FSDP Wrapping
@@ -117,8 +109,8 @@ def parallelize_qwen3_vl(
     if visual_compile_enabled:
         # try fullgraph=True, use TORCH_LOGS="recompiles,guards" to debug, use TORCH_LOGS="dynamic" to check the code forcing recompile
         # advanced: rewrite a Qwen-style view operation so that it is "compiler-friendly" and stops triggering recompiles
-        model.visual = torch.compile(model.visual, backend=job_config.compile.backend, fullgraph=True)
-        logger.info("Applied torch.compile to entire vision encoder")
+        model.visual = torch.compile(model.visual, backend=job_config.compile.backend, fullgraph=False)
+        logger.info("Applied torch.compile (fullgraph=False) to vision encoder")
 
         # compile the core part only, does not work
         # for i, block in enumerate(model.visual.blocks):

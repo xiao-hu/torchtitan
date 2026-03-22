@@ -108,34 +108,12 @@ def get_placeholder_mask(
     
     HF Reference: Lines 1221-1250 in modeling_qwen3_vl.py
     """
-    # Find image token positions
-    special_image_mask = input_ids == image_token_id  # (bs, seq_len)
-    n_image_tokens = special_image_mask.sum()
-    
-    # Expand to match embedding dimension
-    special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-    
-    # Validate image token counts
-    if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
-        raise ValueError(
-            f"Image features and image tokens do not match: tokens: {n_image_tokens}, "
-            f"features {image_features.shape[0]}"
-        )
-    
-    # Find video token positions
-    special_video_mask = input_ids == video_token_id  # (bs, seq_len)
-    n_video_tokens = special_video_mask.sum()
-    
-    # Expand to match embedding dimension
-    special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-    
-    # Validate video token counts
-    if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
-        raise ValueError(
-            f"Videos features and video tokens do not match: tokens: {n_video_tokens}, "
-            f"features {video_features.shape[0]}"
-        )
-    
+    # Find image token positions — no CPU sync needed
+    special_image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+
+    # Find video token positions — no CPU sync needed
+    special_video_mask = (input_ids == video_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+
     return special_image_mask, special_video_mask
 
 
@@ -474,12 +452,8 @@ class Qwen3VLModel(nn.Module):
             pixel_values, grid_thw=image_grid_thw
         )
         
-        # Split embeddings by grid sizes for each image
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
-        ).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
-        
+        # Return flat embeddings directly (caller will use as-is)
+        # No need to split by grid sizes — the flat tensor is ready for masked_scatter
         return image_embeds, deepstack_image_embeds
     
     def get_video_features(
@@ -527,8 +501,8 @@ class Qwen3VLModel(nn.Module):
             image_embeds, deepstack_image_embeds = self.get_image_features(
                 pixel_values, image_grid_thw
             )
-            # Concatenate all image embeddings
-            image_embeds = torch.cat(image_embeds, dim=0).to(
+            # Ensure correct device/dtype
+            image_embeds = image_embeds.to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
             
@@ -550,8 +524,8 @@ class Qwen3VLModel(nn.Module):
             video_embeds, deepstack_video_embeds = self.get_video_features(
                 pixel_values_videos, video_grid_thw
             )
-            # Concatenate all video embeddings
-            video_embeds = torch.cat(video_embeds, dim=0).to(
+            # Ensure correct device/dtype
+            video_embeds = video_embeds.to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
             

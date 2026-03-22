@@ -89,8 +89,10 @@ class Qwen3VLVisionEncoder(Qwen3VLVisionModel):
             - final_features: [seq_len, out_hidden_size]
             - deepstack_features_list: List of intermediate features for DeepStack
         """
-        # HF model returns (hidden_states, deepstack_features_list)
-        return super().forward(hidden_states, grid_thw, **kwargs)
+        # HF model returns BaseModelOutputWithDeepstackFeatures
+        output = super().forward(hidden_states, grid_thw, **kwargs)
+        # Extract merged features (pooler_output) and deepstack features
+        return output.pooler_output, output.deepstack_features
 
 
 # Convenience: Export HF components for use in other parts of the model
