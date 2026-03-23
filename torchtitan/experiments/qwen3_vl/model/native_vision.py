@@ -22,7 +22,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from .args import Qwen3VLVisionArgs
 
@@ -82,8 +81,8 @@ class VisionMLP(nn.Module):
 class VisionAttention(nn.Module):
     """Multi-head attention with 2D RoPE for vision.
 
-    Uses FlexAttention with BlockMask for compile-friendly per-image attention.
-    No per-image chunking, no .tolist() sync, no dynamic splits.
+    Uses SDPA for compile-friendly attention. Each image attends within itself
+    via an attention mask (no cross-image attention).
     """
 
     def __init__(self, hidden_size: int, num_heads: int):
@@ -96,13 +95,13 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        block_mask: BlockMask,
+        cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: (total_seq, hidden_size) - flat across all images
-            block_mask: FlexAttention BlockMask for per-image attention
+            cu_seqlens: (num_images + 1,) - cumulative sequence lengths
             position_embeddings: (cos, sin) each (total_seq, head_dim)
         """
         seq_len = hidden_states.shape[0]
@@ -115,18 +114,24 @@ class VisionAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Reshape for FlexAttention: (1, n_heads, seq_len, head_dim)
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+        # Per-image attention: split by cu_seqlens, attend within each image
+        # This avoids materializing a full (seq_len, seq_len) attention mask
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        q_chunks = torch.split(q, lengths, dim=0)
+        k_chunks = torch.split(k, lengths, dim=0)
+        v_chunks = torch.split(v, lengths, dim=0)
 
-        # FlexAttention with BlockMask — no per-image splitting needed
-        out = torch.nn.attention.flex_attention.flex_attention(
-            q, k, v, block_mask=block_mask
-        )
+        attn_outputs = []
+        for q_c, k_c, v_c in zip(q_chunks, k_chunks, v_chunks):
+            # (img_len, n_heads, head_dim) → (1, n_heads, img_len, head_dim)
+            q_c = q_c.transpose(0, 1).unsqueeze(0)
+            k_c = k_c.transpose(0, 1).unsqueeze(0)
+            v_c = v_c.transpose(0, 1).unsqueeze(0)
+            out_c = F.scaled_dot_product_attention(q_c, k_c, v_c, is_causal=False)
+            # (1, n_heads, img_len, head_dim) → (img_len, n_heads * head_dim)
+            attn_outputs.append(out_c.squeeze(0).transpose(0, 1).reshape(-1, self.num_heads * self.head_dim))
 
-        # Reshape back: (seq_len, hidden_size)
-        out = out.squeeze(0).transpose(0, 1).reshape(seq_len, -1).contiguous()
+        out = torch.cat(attn_outputs, dim=0).contiguous()
         return self.proj(out)
 
 
@@ -143,11 +148,11 @@ class VisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        block_mask: BlockMask,
+        cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), block_mask, position_embeddings
+            self.norm1(hidden_states), cu_seqlens, position_embeddings
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
@@ -244,22 +249,28 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
     def dtype(self):
         return self.patch_embed.weight.dtype
 
-    @torch.compiler.disable  # bilinear interp uses per-image linspace (not perf-critical)
     def _compute_position_embeddings(
         self, grid_thw: torch.Tensor
     ) -> torch.Tensor:
         """Compute interpolated learned position embeddings.
 
-        The bilinear interpolation requires per-image linspace (different h, w),
-        so this stays outside compile. But it's only ~1% of forward time.
-        The spatial merge permutation uses the batched _build_merge_indices.
+        Follows HF's fast_pos_embed_interpolate but uses tensor ops.
+
+        Args:
+            grid_thw: (num_images, 3) - temporal, height, width per image
+
+        Returns:
+            (total_patches, hidden_size) - position embeddings for all patches
         """
         device = self.pos_embed.weight.device
         merge_size = self.spatial_merge_size
         num_grid = self.num_grid_per_side
+
+        # We need to iterate per-image because each has different h, w
+        # This happens once per forward, not in the hot loop
         grid_thw_list = grid_thw.tolist()
 
-        # Bilinear interpolation indices and weights (per-image, different h/w)
+        # Bilinear interpolation indices and weights
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
@@ -291,208 +302,128 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
                 (dh[:, None] * (1 - dw)[None, :]).flatten(),
                 (dh[:, None] * dw[None, :]).flatten(),
             ]
+
             for i in range(4):
                 idx_list[i].append(indices[i])
                 weight_list[i].append(weights[i])
 
+        # Concatenate per-corner indices and weights across all images
         idx_tensor = torch.stack([torch.cat(idx_list[i]) for i in range(4)], dim=0).long()
         weight_tensor = torch.stack([torch.cat(weight_list[i]) for i in range(4)], dim=0)
         weight_tensor = weight_tensor.to(self.pos_embed.weight.dtype)
 
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(-1)
-        patch_pos_embeds = pos_embeds.sum(dim=0)  # (total_hw_patches, hidden)
+        patch_pos_embeds = pos_embeds.sum(dim=0)  # (total_patches, hidden_size)
 
-        # Repeat for temporal frames and apply spatial merge permutation
-        # Use batched merge indices
-        merge_indices = self._build_merge_indices(grid_thw)
-        patch_pos_embeds_expanded = torch.repeat_interleave(
-            patch_pos_embeds, torch.repeat_interleave(grid_thw[:, 0], grid_thw[:, 1] * grid_thw[:, 2]),
-            dim=0,
-        )
-        # Wait — repeat_interleave on pos embeds for temporal is wrong here because
-        # pos_embeds is (sum(h*w), D) not (sum(t*h*w), D). Need to repeat per-image.
-        # Fall back to per-image repeat for correctness.
+        # Split by image and apply spatial merge permutation
         sizes = [int(h) * int(w) for _, h, w in grid_thw_list]
         splits = torch.split(patch_pos_embeds, sizes)
-        expanded = []
-        for pos_embed, (t, _, _) in zip(splits, grid_thw_list):
-            expanded.append(pos_embed.repeat(int(t), 1))
-        patch_pos_embeds = torch.cat(expanded, dim=0)  # (total_patches, hidden)
 
-        # Apply merge permutation via gather
-        return patch_pos_embeds[merge_indices]
+        result = []
+        for pos_embed, (t, h, w) in zip(splits, grid_thw_list):
+            t, h, w = int(t), int(h), int(w)
+            pos_embed = pos_embed.repeat(t, 1)  # repeat for temporal frames
+            # Spatial merge permutation: group merge_size x merge_size patches
+            pos_embed = (
+                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+            result.append(pos_embed)
 
-    def _build_merge_indices(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Build gather indices for spatial merge permutation — no .tolist() needed.
+        return torch.cat(result, dim=0)
 
-        For each image, patches are laid out as (t, h, w) in row-major order.
-        After merge permutation, they become (t, h//m, w//m, m, m) order.
-        This function computes the permutation indices using tensor ops.
+    def _compute_rotary_pos_emb(
+        self, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute 2D rotary position embeddings from grid dimensions.
 
         Args:
             grid_thw: (num_images, 3)
 
         Returns:
-            (total_patches,) - index tensor for gather
-        """
-        device = grid_thw.device
-        merge_size = self.spatial_merge_size
-
-        # Per-frame patch count and merged dimensions
-        t_vals = grid_thw[:, 0]  # (N,)
-        h_vals = grid_thw[:, 1]  # (N,)
-        w_vals = grid_thw[:, 2]  # (N,)
-        hw_vals = h_vals * w_vals  # patches per frame
-        thw_vals = t_vals * hw_vals  # patches per image
-
-        # We need per-image offsets in the flat sequence
-        cu_patches = F.pad(thw_vals.cumsum(0), (1, 0), value=0)  # (N+1,)
-
-        # Build indices per image (this still needs per-image iteration for different h, w)
-        # But we minimize it to just index computation, no tensor splitting
-        all_indices = []
-        for i in range(grid_thw.shape[0]):
-            t = t_vals[i].item()
-            h = h_vals[i].item()
-            w = w_vals[i].item()
-            offset = cu_patches[i].item()
-
-            mh = h // merge_size
-            mw = w // merge_size
-
-            # Original flat index within one frame: row * w + col
-            # Merge permutation: (mh, mw, merge_size, merge_size) iteration order
-            # maps to original (mh*merge_size + mr) * w + (mw*merge_size + mc)
-            block_r = torch.arange(mh, device=device)
-            block_c = torch.arange(mw, device=device)
-            intra_r = torch.arange(merge_size, device=device)
-            intra_c = torch.arange(merge_size, device=device)
-
-            # (mh, mw, merge_size, merge_size) → flat original index
-            orig_row = block_r[:, None, None, None] * merge_size + intra_r[None, None, :, None]
-            orig_col = block_c[None, :, None, None] * merge_size + intra_c[None, None, None, :]
-            flat_idx = (orig_row * w + orig_col).reshape(-1)  # (h*w,)
-
-            # Repeat for t frames, add frame offsets
-            if t > 1:
-                frame_offsets = torch.arange(t, device=device)[:, None] * (h * w)
-                flat_idx = (flat_idx[None, :] + frame_offsets).reshape(-1)  # (t*h*w,)
-
-            all_indices.append(flat_idx + offset)
-
-        return torch.cat(all_indices, dim=0)
-
-    def _compute_rotary_pos_emb(
-        self, grid_thw: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute 2D rotary position embeddings — uses batched merge indices.
-
-        The row/col coordinates after merge permutation are computed via
-        _build_merge_indices pattern, then looked up in the frequency table.
+            (cos, sin) each of shape (total_patches, head_dim)
         """
         merge_size = self.spatial_merge_size
         device = self.rotary_pos_emb.inv_freq.device
 
-        # Compute max h/w for frequency table (no .tolist())
-        max_hw = torch.max(torch.max(grid_thw[:, 1]), torch.max(grid_thw[:, 2])).item()
+        grid_thw_list = grid_thw.tolist()
+        max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
         freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim//2)
 
-        # Build merge-permuted (row, col) coordinates per patch
-        t_vals = grid_thw[:, 0]
-        h_vals = grid_thw[:, 1]
-        w_vals = grid_thw[:, 2]
-        thw_vals = t_vals * h_vals * w_vals
-        cu_patches = F.pad(thw_vals.cumsum(0), (1, 0), value=0)
+        total_tokens = sum(int(t) * int(h) * int(w) for t, h, w in grid_thw_list)
+        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
 
-        total_tokens = thw_vals.sum().item()
-        row_ids = torch.empty(total_tokens, dtype=torch.long, device=device)
-        col_ids = torch.empty(total_tokens, dtype=torch.long, device=device)
+        offset = 0
+        for t, h, w in grid_thw_list:
+            t, h, w = int(t), int(h), int(w)
+            merged_h, merged_w = h // merge_size, w // merge_size
 
-        for i in range(grid_thw.shape[0]):
-            t = t_vals[i].item()
-            h = h_vals[i].item()
-            w = w_vals[i].item()
-            offset = cu_patches[i].item()
-            n = t * h * w
-            mh = h // merge_size
-            mw = w // merge_size
+            block_rows = torch.arange(merged_h, device=device)
+            block_cols = torch.arange(merged_w, device=device)
+            intra_row = torch.arange(merge_size, device=device)
+            intra_col = torch.arange(merge_size, device=device)
 
-            block_r = torch.arange(mh, device=device)
-            block_c = torch.arange(mw, device=device)
-            intra_r = torch.arange(merge_size, device=device)
-            intra_c = torch.arange(merge_size, device=device)
+            row_idx = (block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None])
+            col_idx = (block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :])
 
-            row_idx = (block_r[:, None, None, None] * merge_size + intra_r[None, None, :, None])
-            col_idx = (block_c[None, :, None, None] * merge_size + intra_c[None, None, None, :])
-            row_idx = row_idx.expand(mh, mw, merge_size, merge_size).reshape(-1)
-            col_idx = col_idx.expand(mh, mw, merge_size, merge_size).reshape(-1)
+            row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+            col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
 
+            coords = torch.stack((row_idx, col_idx), dim=-1)
             if t > 1:
-                row_idx = row_idx.repeat(t)
-                col_idx = col_idx.repeat(t)
+                coords = coords.repeat(t, 1)
 
-            row_ids[offset:offset + n] = row_idx
-            col_ids[offset:offset + n] = col_idx
+            num_tokens = coords.shape[0]
+            pos_ids[offset: offset + num_tokens] = coords
+            offset += num_tokens
 
-        # Lookup rotary frequencies
-        row_emb = freq_table[row_ids]  # (total, dim//2)
-        col_emb = freq_table[col_ids]  # (total, dim//2)
-        embeddings = torch.cat((row_emb, col_emb), dim=-1)  # (total, dim)
-        emb = torch.cat((embeddings, embeddings), dim=-1)  # (total, 2*dim)
+        embeddings = freq_table[pos_ids].flatten(1)  # (total_patches, head_dim)
+        emb = torch.cat((embeddings, embeddings), dim=-1)
         return emb.cos(), emb.sin()
 
     def _compute_cu_seqlens(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Compute cumulative sequence lengths from grid dimensions — no .tolist()."""
+        """Compute cumulative sequence lengths from grid dimensions."""
         seq_lens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         )
         cu_seqlens = F.pad(seq_lens.cumsum(0, dtype=torch.int32), (1, 0), value=0)
         return cu_seqlens
 
-    @torch.compiler.disable  # create_block_mask uses Python control flow internally
-    def _create_block_mask(
-        self, grid_thw: torch.Tensor, hidden_states: torch.Tensor
-    ) -> BlockMask:
-        """Create FlexAttention BlockMask — uses repeat_interleave instead of Python loop."""
-        seq_len = hidden_states.shape[0]
-        device = hidden_states.device
-
-        # Build image_ids via repeat_interleave (no Python loop)
-        cu_seqlens = self._compute_cu_seqlens(grid_thw)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        num_images = seq_lens.shape[0]
-        image_ids = torch.repeat_interleave(
-            torch.arange(num_images, device=device, dtype=torch.int32),
-            seq_lens,
-        )
-
-        def vision_mask_mod(b, h, q_idx, kv_idx):
-            return image_ids[q_idx] == image_ids[kv_idx]
-
-        block_mask = create_block_mask(
-            vision_mask_mod, B=1, H=None, Q_LEN=seq_len, KV_LEN=seq_len,
-            device=device,
-        )
-        return block_mask
-
     def _spatial_merge(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
         merger: VisionPatchMerger,
     ) -> torch.Tensor:
-        """Apply spatial merge using gather indices — no .tolist() for the gather.
+        """Apply spatial merge: group merge_size x merge_size patches and project.
 
-        The merge permutation reorders patches from (t, h, w) layout to
-        (t, h//m, w//m, m, m) layout, then groups m*m patches into one token.
+        Args:
+            hidden_states: (total_patches, hidden_size)
+            grid_thw: (num_images, 3)
+            merger: VisionPatchMerger module
+
+        Returns:
+            (total_merged_patches, out_hidden_size)
         """
-        # Build merge indices (reorders patches into merge groups)
-        merge_indices = self._build_merge_indices(grid_thw)
-        # Gather in merge order: adjacent m*m patches become contiguous
-        reordered = hidden_states[merge_indices]
-        # Now reshape: every (merge_size^2) consecutive patches form one merged token
-        merge_unit = self.spatial_merge_size ** 2
-        # reordered is (total_patches, hidden_size), reshape to (total_merged, merge_unit * hidden)
-        reordered = reordered.view(-1, merge_unit * hidden_states.shape[-1])
-        return merger(reordered)
+        merge_size = self.spatial_merge_size
+        grid_thw_list = grid_thw.tolist()
+
+        # Split by image, reshape for merging, cat back
+        sizes = [int(t) * int(h) * int(w) for t, h, w in grid_thw_list]
+        splits = torch.split(hidden_states, sizes)
+
+        merged = []
+        for chunk, (t, h, w) in zip(splits, grid_thw_list):
+            t, h, w = int(t), int(h), int(w)
+            # Reshape: (t*h*w, D) → (t, h//m, m, w//m, m, D) → (t, h//m, w//m, m*m*D)
+            chunk = (
+                chunk.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .reshape(t * (h // merge_size) * (w // merge_size), -1)
+            )
+            merged.append(chunk)
+
+        merged_states = torch.cat(merged, dim=0)
+        return merger(merged_states)
 
     def forward(
         self,
@@ -523,13 +454,13 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
         cos, sin = self._compute_rotary_pos_emb(grid_thw)
         position_embeddings = (cos, sin)
 
-        # 4. Create FlexAttention BlockMask for per-image attention
-        block_mask = self._create_block_mask(grid_thw, hidden_states)
+        # 4. Compute cumulative sequence lengths for per-image attention
+        cu_seqlens = self._compute_cu_seqlens(grid_thw)
 
         # 5. Transformer blocks with DeepStack extraction
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states = block(hidden_states, block_mask, position_embeddings)
+            hidden_states = block(hidden_states, cu_seqlens, position_embeddings)
 
             if layer_idx in self.deepstack_visual_indexes:
                 ds_idx = self.deepstack_visual_indexes.index(layer_idx)
