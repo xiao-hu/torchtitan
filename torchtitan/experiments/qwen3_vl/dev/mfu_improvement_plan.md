@@ -189,16 +189,25 @@ Key compile-breaking patterns to avoid:
 | 3.1c Visual compile (native, dynamic=True, SDPA) | Done | +6% peak | ~16.8% |
 | 3.1d FlexAttention + compiler.disable | Done | Same as 3.1c (~16.4%) | ~16.4% |
 | 3.1e Batched tensor ops (gather indices) | Done | Same MFU, cleaner code | ~16.3% |
-| 4.1 seq_len 8192→10240 | Done | +18% TPS, peak 19.1% MFU* | **19.1%*** |
+| 4.1 seq_len 8192→10240 | Done | +18% TPS, peak 19.1% MFU* | 19.1%* |
 | 4.2 MFU calculation fix (include vision FLOPs) | Done | More accurate reporting | — |
+| 4.3 seq_len=12288 + fsdp_reshard=always | Done | Peak 21.5%, steady 20% | 21.5%* |
+| **4.4 FlexAttention + maybe_mark_dynamic** | **Done** | **Same peak, +1% steady, -3 GiB memory** | **21.5%*** |
 
-\* MFU after 4.2 includes vision encoder FLOPs (~0.3 patches/token). Not directly comparable to earlier numbers. Equivalent old-calc MFU ~16.8%.
+\* MFU after 4.2 includes vision encoder FLOPs (~0.3 patches/token). Not directly comparable to earlier numbers.
 
-**Current best: 19.1% MFU*** (seq_len=10240, native + SDPA + dynamic=True, commit 559e0e07)
+**Current best: 21.5% peak / 21% steady MFU, 123 GiB (88%)** (commit ab94bc99)
+- FlexAttention (BlockMask for per-image attention, no torch.split)
+- maybe_mark_dynamic on dim 0 (no dynamic=True — compiler optimizes static dims)
+- @torch.compiler.disable on per-image methods (pos embed, rotary, spatial merge, block mask)
+- seq_len=12288, fsdp_reshard_after_forward="always", ep=2
 
-**Also tested:**
-- seq_len=12288: **21.2% MFU** but OOMs on outlier batches (step 6)
+**Also tested and rejected:**
 - seq_len=16384: OOMs immediately
+- Padded batched SDPA: -6% regression (pad/unpad + wasted compute)
+- Compiled inner SDPA function: -1-5% regression (270 dispatch calls/step)
+- SDPA + mark_dynamic (no dynamic=True): Inductor KeyError bug from torch.split
+- SDPA + dynamic=True: Works (21.5% peak) but 3 GiB more memory than FlexAttention + mark_dynamic
 
 ### Profiled Gap Analysis (seq_len=8192, iteration 20, rank0, 2 steps = 4.57s)
 
@@ -267,29 +276,42 @@ GPU utilization: **50%**. Step: 3.14s. BmmBackward now 0.76s (#1 CPU overhead).
 
 The BmmBackward (0.76s) is the cost of per-image attention without padding waste. All alternatives introduce overhead that exceeds the BmmBackward savings.
 
-### mark_dynamic — TESTED, NOT APPLICABLE
+### mark_dynamic — RESOLVED with FlexAttention
 
 | Approach | Result |
 |----------|--------|
 | `mark_dynamic` inside forward() | Fails: "Attempt to trace forbidden callable" |
-| `mark_dynamic` in caller + no `dynamic=True` | OOM: compiler specializes per shape, recompiles 25 variants |
-| `maybe_mark_dynamic` + `dynamic=True` | Redundant, same behavior as just `dynamic=True` |
+| SDPA + `mark_dynamic` in caller (no `dynamic=True`) | Inductor KeyError: torch.split creates unbacked SymInts |
+| SDPA + `maybe_mark_dynamic` + `dynamic=True` | Redundant, same as dynamic=True |
+| **FlexAttention + `maybe_mark_dynamic` (no `dynamic=True`)** | **WORKS! Same peak MFU, +1% steady, -3 GiB memory** |
 
-Conclusion: `dynamic=True` on the whole encoder is the correct approach. `mark_dynamic` is designed for standalone compiled functions, not whole-module compile with FSDP.
+**Key insight**: `mark_dynamic` fails with SDPA chunking because `torch.split` creates unbacked SymInts that Inductor can't handle. FlexAttention eliminates `torch.split` entirely, making `mark_dynamic` work. Without `dynamic=True`, the compiler optimizes static dims (hidden_size=1152, num_heads=16, head_dim=36) more aggressively → better kernels + smaller compile cache.
+
+### Profiled Bottleneck (FlexAttention + mark_dynamic, seq_len=12288)
+
+GPU utilization: **52%**. Step: 2.98s/step. GPU kernel: 3.11s/2 steps.
+
+| Remaining Cost | Time | Notes |
+|---------------|------|-------|
+| FSDP dispatch (PythonDispatchMode) | 0.82s | Framework inherent |
+| BmmBackward (vision attn bwd) | 0.74s | FlexAttention backward recomputation |
+| CompiledFunction dispatch | 0.55s | Compile framework overhead |
+| item() sync | 0.51s | 20 calls from compile guards |
+| PythonSubclass (FSDP wrappers) | 0.45s | Framework inherent |
+| aten::sort (MOE routing) | 0.42s | Token routing sort |
+| NCCL | 0.93s | SendRecv 0.36s, AllGather 0.24s, ReduceScatter 0.20s |
+
+The remaining 48% GPU idle is dominated by **framework overhead** (FSDP, compile dispatch) and **inherent vision backward cost** — not addressable without PyTorch framework changes.
+
+**Gradient accumulation**: Would NOT help MFU. MFU measures per-forward-backward efficiency. GA just runs multiple passes before optimizer.step(), each with the same MFU. The seq_len increase was the correct approach (amortizes fixed costs within each pass).
 
 ### Future Directions
 
-1. **Reduce MOE overhead**: `aten::sort` (0.46s) from token routing is a new top cost.
+1. **Reduce MOE overhead**: `aten::sort` (0.42s) from token routing. Consider sorted routing or fewer experts.
 
-2. **Flash attention with cu_seqlens**: PyTorch's flash attention backend supports `cu_seqlens` natively for variable-length sequences without padding. If `F.scaled_dot_product_attention` with `enable_flash=True` can accept cu_seqlens, this would be the ideal solution — no padding, no per-image loop, compiled backward.
+2. **Overlap vision/language compute** (high effort): Run vision encoder on separate CUDA stream while language model processes previous step's backward.
 
-3. **Overlap vision/language compute** (high effort): Async CUDA streams.
-
-4. **Pre-compute vision features** (high effort): For frozen encoder SFT.
-
-3. **Overlap vision/language compute** (high effort): Run vision encoder on separate CUDA stream.
-
-4. **Pre-compute vision features** (high effort): Cache features for frozen encoder during SFT.
+3. **Pre-compute vision features** (high effort): Cache features for frozen encoder during SFT. Eliminates vision from training loop entirely.
 
 ## Appendix: Training Results
 
