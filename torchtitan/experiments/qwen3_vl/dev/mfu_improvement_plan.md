@@ -188,25 +188,108 @@ Key compile-breaking patterns to avoid:
 | 3.1b Visual compile (native, static) | Blocked | Inductor dynamic shape bug | — |
 | 3.1c Visual compile (native, dynamic=True, SDPA) | Done | +6% peak | ~16.8% |
 | 3.1d FlexAttention + compiler.disable | Done | Same as 3.1c (~16.4%) | ~16.4% |
-| 3.1e Batched tensor ops (gather indices) | Done | Same MFU, cleaner code | **~16.3%** |
+| 3.1e Batched tensor ops (gather indices) | Done | Same MFU, cleaner code | ~16.3% |
+| 4.1 seq_len 8192→10240 | Done | +18% TPS, peak 19.1% MFU* | **19.1%*** |
+| 4.2 MFU calculation fix (include vision FLOPs) | Done | More accurate reporting | — |
 
-**Current best: 16.8% MFU** (commit 2a566042, native + SDPA + dynamic=True)
-**Current config: 16.3% MFU** (commit fc8739d3, native + FlexAttention + batched ops)
+\* MFU after 4.2 includes vision encoder FLOPs (~0.3 patches/token). Not directly comparable to earlier numbers. Equivalent old-calc MFU ~16.8%.
 
-### Remaining Gap Analysis
+**Current best: 19.1% MFU*** (seq_len=10240, native + SDPA + dynamic=True, commit 559e0e07)
 
-Text-only MFU is 33%. Current VL MFU is ~16%. The ~17% gap:
-- **Vision encoder overhead** (~30-40%): Vision compute is not counted in MFU. 538M params, 27 layers. Inherent cost.
-- **NCCL communication** (~15-20%): 35% of GPU kernel time. MOE all_to_all + FSDP allgather.
-- **Compile cache memory** (~10%): dynamic=True uses 10-15 GiB, limits batch headroom.
-- **Variable image sizes** (~10%): Step time varies 3x (2.4s→9s) based on image content.
+**Also tested:**
+- seq_len=12288: **21.2% MFU** but OOMs on outlier batches (step 6)
+- seq_len=16384: OOMs immediately
+
+### Profiled Gap Analysis (seq_len=8192, iteration 20, rank0, 2 steps = 4.57s)
+
+GPU utilization: **52%** (48% idle). Step time: 2.28s/step.
+
+**GPU kernel time: 2.37s**
+| Category | Time | % |
+|----------|------|---|
+| NCCL | 0.86s | 36.4% |
+| GEMM | 0.51s | 21.5% |
+| Attention | 0.33s | 14.0% |
+| Index/Gather | 0.25s | 10.6% |
+| Other | 0.22s | 9.1% |
+| Elementwise | 0.20s | 8.4% |
+
+**CPU overhead (the 48% idle = ~2.2s)**
+| Source | Time | Notes |
+|--------|------|-------|
+| BmmBackward | 0.44s | Vision attn backward, uncompiled due to SDPA graph break |
+| Compiled region dispatch | 0.93s | 4 regions × 0.23s, framework overhead |
+| PythonDispatchMode | 0.48s | FSDP parameter management |
+| item() sync | 0.12s | 76 calls (compile guards + FSDP) |
+| nonzero | 0.13s | 7 calls (masked_scatter) |
+| aten::_to_copy | 0.19s | dtype conversions |
+
+**NCCL detail:**
+- AllGather (FSDP): 0.35s — now larger than MOE
+- SendRecv (MOE all_to_all): 0.25s
+- ReduceScatter: 0.23s
+
+### Completed Steps
+
+1. **seq_len=12288 + fsdp_reshard=always** — DONE (commit 938034fe)
+   `fsdp_reshard_after_forward="always"` provided ~5 GiB headroom for seq_len=12288.
+   Result: **21.5% peak MFU, 20% steady**. No OOM. Memory: 126 GiB (90%).
+
+2. **NCCL communication overlap** — ALREADY IN PLACE
+   `fsdp_reshard_after_forward="always"` enables FSDP AllGather/ReduceScatter overlap.
+   Profiling confirms AllGather dropped from 0.35s → 0.23s. MOE SendRecv (0.36s) is now
+   the dominant NCCL cost and is inherently synchronous.
+
+3. **Compile vision attention backward** — TESTED, REJECTED
+   Padded batched SDPA: regression from 21% → 15% MFU. The pad/unpad overhead + wasted
+   compute on padding tokens outweighs the BmmBackward savings. Per-image SDPA chunking
+   remains the best approach for now.
+
+### Profiled Bottleneck (seq_len=12288, reshard=always)
+
+GPU utilization: **50%**. Step: 3.14s. BmmBackward now 0.76s (#1 CPU overhead).
+
+| Top CPU costs | Time |
+|--------------|------|
+| PythonDispatchMode (FSDP) | 0.87s |
+| BmmBackward (vision attn bwd) | 0.76s |
+| CompiledFunction | 0.53s |
+| aten::sort (MOE routing) | 0.46s |
+| item() sync | 0.34s |
+
+### Compile Vision Attention Backward — ALL APPROACHES TESTED, NONE IMPROVED MFU
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| FlexAttention + BlockMask | Same MFU (16.4% vs 16.8%) | BlockMask creation overhead |
+| Padded batched SDPA | -6% regression (15% vs 21%) | Pad/unpad + wasted compute |
+| Compiled inner SDPA function | -1-5% regression (20% vs 21%) | 270 compile dispatches/step |
+
+The BmmBackward (0.76s) is the cost of per-image attention without padding waste. All alternatives introduce overhead that exceeds the BmmBackward savings.
+
+### mark_dynamic — TESTED, NOT APPLICABLE
+
+| Approach | Result |
+|----------|--------|
+| `mark_dynamic` inside forward() | Fails: "Attempt to trace forbidden callable" |
+| `mark_dynamic` in caller + no `dynamic=True` | OOM: compiler specializes per shape, recompiles 25 variants |
+| `maybe_mark_dynamic` + `dynamic=True` | Redundant, same behavior as just `dynamic=True` |
+
+Conclusion: `dynamic=True` on the whole encoder is the correct approach. `mark_dynamic` is designed for standalone compiled functions, not whole-module compile with FSDP.
 
 ### Future Directions
 
-1. **Increase effective batch throughput**: gradient accumulation, larger seq_len
-2. **Overlap vision/language compute**: async CUDA streams for vision encoder
-3. **Pre-compute vision features**: if encoder is frozen during SFT
-4. **Reduce compile cache**: targeted mark_dynamic on specific dims
+1. **Reduce MOE overhead**: `aten::sort` (0.46s) from token routing is a new top cost.
+
+2. **Flash attention with cu_seqlens**: PyTorch's flash attention backend supports `cu_seqlens` natively for variable-length sequences without padding. If `F.scaled_dot_product_attention` with `enable_flash=True` can accept cu_seqlens, this would be the ideal solution — no padding, no per-image loop, compiled backward.
+
+3. **Overlap vision/language compute** (high effort): Async CUDA streams.
+
+4. **Pre-compute vision features** (high effort): For frozen encoder SFT.
+
+3. **Overlap vision/language compute** (high effort): Run vision encoder on separate CUDA stream.
+
+4. **Pre-compute vision features** (high effort): Cache features for frozen encoder during SFT.
 
 ## Appendix: Training Results
 

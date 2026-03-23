@@ -22,8 +22,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from .args import Qwen3VLVisionArgs
+
+# Compile FlexAttention once (class-level, not per-instance)
+_compiled_flex_attention = torch.compile(flex_attention)
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -79,10 +83,10 @@ class VisionMLP(nn.Module):
 
 
 class VisionAttention(nn.Module):
-    """Multi-head attention with 2D RoPE for vision.
+    """Multi-head attention with 2D RoPE for vision using FlexAttention.
 
-    Uses SDPA for compile-friendly attention. Each image attends within itself
-    via an attention mask (no cross-image attention).
+    FlexAttention with BlockMask handles per-image boundaries without
+    torch.split, enabling mark_dynamic without Inductor unbacked SymInt bugs.
     """
 
     def __init__(self, hidden_size: int, num_heads: int):
@@ -95,43 +99,25 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        block_mask: BlockMask,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states: (total_seq, hidden_size) - flat across all images
-            cu_seqlens: (num_images + 1,) - cumulative sequence lengths
-            position_embeddings: (cos, sin) each (total_seq, head_dim)
-        """
         seq_len = hidden_states.shape[0]
 
-        # QKV projection: (seq_len, 3, n_heads, head_dim)
+        # QKV projection + RoPE
         qkv = self.qkv(hidden_states).reshape(seq_len, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(1)  # each (seq_len, n_heads, head_dim)
-
-        # Apply 2D rotary embeddings
+        q, k, v = qkv.unbind(1)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Per-image attention: split by cu_seqlens, attend within each image
-        # This avoids materializing a full (seq_len, seq_len) attention mask
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        q_chunks = torch.split(q, lengths, dim=0)
-        k_chunks = torch.split(k, lengths, dim=0)
-        v_chunks = torch.split(v, lengths, dim=0)
+        # FlexAttention: (1, n_heads, seq_len, head_dim) — no torch.split needed
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
 
-        attn_outputs = []
-        for q_c, k_c, v_c in zip(q_chunks, k_chunks, v_chunks):
-            # (img_len, n_heads, head_dim) → (1, n_heads, img_len, head_dim)
-            q_c = q_c.transpose(0, 1).unsqueeze(0)
-            k_c = k_c.transpose(0, 1).unsqueeze(0)
-            v_c = v_c.transpose(0, 1).unsqueeze(0)
-            out_c = F.scaled_dot_product_attention(q_c, k_c, v_c, is_causal=False)
-            # (1, n_heads, img_len, head_dim) → (img_len, n_heads * head_dim)
-            attn_outputs.append(out_c.squeeze(0).transpose(0, 1).reshape(-1, self.num_heads * self.head_dim))
+        out = _compiled_flex_attention(q, k, v, block_mask=block_mask)
 
-        out = torch.cat(attn_outputs, dim=0).contiguous()
+        out = out.squeeze(0).transpose(0, 1).reshape(seq_len, -1).contiguous()
         return self.proj(out)
 
 
@@ -148,11 +134,11 @@ class VisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        block_mask: BlockMask,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cu_seqlens, position_embeddings
+            self.norm1(hidden_states), block_mask, position_embeddings
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
@@ -249,6 +235,7 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
     def dtype(self):
         return self.patch_embed.weight.dtype
 
+    @torch.compiler.disable
     def _compute_position_embeddings(
         self, grid_thw: torch.Tensor
     ) -> torch.Tensor:
@@ -333,6 +320,7 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
 
         return torch.cat(result, dim=0)
 
+    @torch.compiler.disable
     def _compute_rotary_pos_emb(
         self, grid_thw: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -390,6 +378,28 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
         cu_seqlens = F.pad(seq_lens.cumsum(0, dtype=torch.int32), (1, 0), value=0)
         return cu_seqlens
 
+    @torch.compiler.disable
+    def _create_block_mask(
+        self, grid_thw: torch.Tensor, seq_len: int, device: torch.device
+    ) -> BlockMask:
+        """Create FlexAttention BlockMask for per-image block-diagonal attention."""
+        cu_seqlens = self._compute_cu_seqlens(grid_thw)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        num_images = seq_lens.shape[0]
+        image_ids = torch.repeat_interleave(
+            torch.arange(num_images, device=device, dtype=torch.int32),
+            seq_lens,
+        )
+
+        def vision_mask_mod(b, h, q_idx, kv_idx):
+            return image_ids[q_idx] == image_ids[kv_idx]
+
+        return create_block_mask(
+            vision_mask_mod, B=1, H=None, Q_LEN=seq_len, KV_LEN=seq_len,
+            device=device,
+        )
+
+    @torch.compiler.disable
     def _spatial_merge(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
         merger: VisionPatchMerger,
@@ -454,13 +464,15 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
         cos, sin = self._compute_rotary_pos_emb(grid_thw)
         position_embeddings = (cos, sin)
 
-        # 4. Compute cumulative sequence lengths for per-image attention
-        cu_seqlens = self._compute_cu_seqlens(grid_thw)
+        # 4. Create FlexAttention BlockMask for per-image attention
+        block_mask = self._create_block_mask(
+            grid_thw, hidden_states.shape[0], hidden_states.device
+        )
 
         # 5. Transformer blocks with DeepStack extraction
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states = block(hidden_states, cu_seqlens, position_embeddings)
+            hidden_states = block(hidden_states, block_mask, position_embeddings)
 
             if layer_idx in self.deepstack_visual_indexes:
                 ds_idx = self.deepstack_visual_indexes.index(layer_idx)

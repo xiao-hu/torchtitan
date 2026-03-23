@@ -445,7 +445,12 @@ class Qwen3VLModel(nn.Module):
         """
         # Cast to vision encoder dtype
         pixel_values = pixel_values.type(self.visual.dtype)
-        
+
+        # Mark dim 0 as dynamic before entering compiled vision encoder.
+        # Tells compiler: total_patches varies, but hidden dims are static.
+        torch._dynamo.maybe_mark_dynamic(pixel_values, 0)
+        torch._dynamo.maybe_mark_dynamic(image_grid_thw, 0)
+
         # Forward through vision encoder - returns (embeddings, deepstack_features)
         image_embeds, deepstack_image_embeds = self.visual(
             pixel_values, grid_thw=image_grid_thw
