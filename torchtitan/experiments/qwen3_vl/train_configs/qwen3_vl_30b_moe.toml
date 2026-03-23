@@ -31,7 +31,7 @@ warmup_steps = 600  # 20% of total steps
 
 [training]
 local_batch_size = 1  # Set to 1: Qwen3-VL collator requires same-sized images per batch
-seq_len = 8192  # Context length for vision-language
+seq_len = 10240  # 1.25x increase (12288 OOMs on outlier batches)
 max_norm = 1.0  # Gradient clipping
 steps = 20  # Start with 10 steps for testing
 dataset = "vqav2"  # Vision-Language dataset from VL_DATASETS registry
