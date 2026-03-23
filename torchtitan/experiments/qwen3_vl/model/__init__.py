@@ -17,7 +17,7 @@ Contains the core model architecture combining:
 from .args import Qwen3VLModelArgs, Qwen3VLVisionArgs, SpecialTokens
 from .model import Qwen3VLModel, Qwen3VLTextModel
 from .state_dict_adapter import Qwen3VLStateDictAdapter
-from .vision import Qwen3VLVisionEncoder
+from .native_vision import Qwen3VLNativeVisionEncoder as Qwen3VLVisionEncoder
 
 __all__ = [
     "Qwen3VLModel",

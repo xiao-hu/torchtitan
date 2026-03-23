@@ -87,8 +87,10 @@ class Qwen3VLStateDictAdapter(Qwen3StateDictAdapter):
         
         for key, value in state_dict.items():
             if key.startswith("visual."):
-                # Vision encoder: add model. prefix
-                hf_key = f"model.{key}"
+                # Vision encoder: convert native names back to HF and add model. prefix
+                hf_key = key.replace(".fc1.", ".linear_fc1.").replace(".fc2.", ".linear_fc2.")
+                # Linear patch embed → Conv3d: would need reshape, skip for now
+                hf_key = f"model.{hf_key}"
                 vision_dict[hf_key] = value
             elif key.startswith("language_model."):
                 # Text model: remove language_model. prefix for parent processing
@@ -141,12 +143,18 @@ class Qwen3VLStateDictAdapter(Qwen3StateDictAdapter):
         vision_dict = {}
         text_dict = {}
         grouped_dict = {}  # GroupedExperts keys - direct conversion, bypass parent
-        
+
         # HF Qwen3-VL-MOE uses GroupedExperts format - convert directly to TorchTitan format
         for key, value in hf_state_dict.items():
             if key.startswith("model.visual."):
-                # Vision encoder: strip model. prefix
+                # Vision encoder: strip model. prefix and convert names for native encoder
                 tt_key = key.replace("model.", "", 1)
+                # Conv3d patch embed → Linear: reshape weight
+                if tt_key == "visual.patch_embed.proj.weight":
+                    # Conv3d weight: (out, in, t, h, w) → Linear: (out, in*t*h*w)
+                    value = value.reshape(value.shape[0], -1)
+                # Rename MLP layers: linear_fc1 → fc1, linear_fc2 → fc2
+                tt_key = tt_key.replace(".linear_fc1.", ".fc1.").replace(".linear_fc2.", ".fc2.")
                 vision_dict[tt_key] = value
                 
             elif key.startswith("model.language_model."):

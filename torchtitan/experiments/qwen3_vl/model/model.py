@@ -25,7 +25,7 @@ from torchtitan.models.qwen3.model.model import \
     apply_rotary_emb as qwen3_apply_rotary_emb
 
 from .args import Qwen3VLModelArgs
-from .vision import Qwen3VLVisionEncoder
+from .native_vision import Qwen3VLNativeVisionEncoder as Qwen3VLVisionEncoder
 
 
 def apply_rotary_emb_mrope(
