@@ -70,7 +70,7 @@ selective_ac_option = "op"  # Checkpoint based on operation policy
 
 [compile]
 enable=true  # 10-30% speedup
-components = ["model", "loss"]  # "visual" disabled: HF vision encoder has too many graph breaks, compile overhead > savings
+components = ["model", "loss"]  # visual compile hits Inductor bug with dynamic shapes from per-image chunking
 
 # Optional: Float8 quantization for further speedup
 # [quantize.linear.float8]
