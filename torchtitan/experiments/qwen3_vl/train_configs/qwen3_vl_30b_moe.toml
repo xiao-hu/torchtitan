@@ -50,7 +50,7 @@ tensor_parallel_degree = 1  # TP across model layers
 context_parallel_degree = 1  # Sequence parallelism
 
 # Expert Parallelism (MOE-specific)
-expert_parallel_degree = 4  # Partition experts across 4 GPUs
+expert_parallel_degree = 2  # Reduced from 4 to halve all_to_all NCCL volume
 expert_tensor_parallel_degree = 1  # TP within each expert
 
 # FSDP Configuration
