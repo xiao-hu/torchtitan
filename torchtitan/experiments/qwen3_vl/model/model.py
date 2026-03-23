@@ -328,16 +328,15 @@ class Qwen3VLTextModel(Qwen3Model):
         # Cast to correct device/dtype
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-        
-        # Clone to avoid in-place modification issues
-        hidden_states = hidden_states.clone()
-        
-        # Add visual features at visual token positions
-        hidden_states[visual_pos_masks, :] = (
-            hidden_states[visual_pos_masks, :] + visual_embeds
-        )
-        
-        return hidden_states
+
+        # Add visual features at masked positions.
+        # Use masked_scatter to place flat visual_embeds at mask positions, then add.
+        # (masked_scatter is the most efficient primitive for flat→sparse scatter)
+        mask_3d = visual_pos_masks.unsqueeze(-1).expand_as(hidden_states)
+        visual_add = hidden_states.new_zeros(hidden_states.shape)
+        visual_add.masked_scatter_(mask_3d, visual_embeds)
+
+        return hidden_states + visual_add
     
     def forward(
         self,
