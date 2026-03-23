@@ -31,7 +31,7 @@ warmup_steps = 600  # 20% of total steps
 
 [training]
 local_batch_size = 1  # Set to 1: Qwen3-VL collator requires same-sized images per batch
-seq_len = 10240  # 1.25x increase (12288 OOMs on outlier batches)
+seq_len = 12288  # Increased from 8192 to amortize fixed costs
 max_norm = 1.0  # Gradient clipping
 steps = 20  # Start with 10 steps for testing
 dataset = "vqav2"  # Vision-Language dataset from VL_DATASETS registry
@@ -54,7 +54,7 @@ expert_parallel_degree = 2  # Reduced from 4 to halve all_to_all NCCL volume
 expert_tensor_parallel_degree = 1  # TP within each expert
 
 # FSDP Configuration
-fsdp_reshard_after_forward = "default"  # Memory-efficient resharding
+fsdp_reshard_after_forward = "always"  # Aggressive resharding to reduce peak memory for seq_len=12288
 
 [checkpoint]
 enable = false
