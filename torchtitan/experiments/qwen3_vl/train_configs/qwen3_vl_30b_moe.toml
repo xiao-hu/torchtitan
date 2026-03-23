@@ -70,7 +70,7 @@ selective_ac_option = "op"  # Checkpoint based on operation policy
 
 [compile]
 enable=true  # 10-30% speedup
-components = ["model", "loss"]  # visual compile hits Inductor bug with dynamic shapes from per-image chunking
+components = ["model", "visual", "loss"]  # visual: native encoder with dynamic=True compile
 
 # Optional: Float8 quantization for further speedup
 # [quantize.linear.float8]

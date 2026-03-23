@@ -109,8 +109,8 @@ def parallelize_qwen3_vl(
     if visual_compile_enabled:
         # try fullgraph=True, use TORCH_LOGS="recompiles,guards" to debug, use TORCH_LOGS="dynamic" to check the code forcing recompile
         # advanced: rewrite a Qwen-style view operation so that it is "compiler-friendly" and stops triggering recompiles
-        model.visual = torch.compile(model.visual, backend=job_config.compile.backend, fullgraph=False)
-        logger.info("Applied torch.compile to native vision encoder")
+        model.visual = torch.compile(model.visual, backend=job_config.compile.backend, fullgraph=False, dynamic=True)
+        logger.info("Applied torch.compile (dynamic=True) to native vision encoder")
 
         # compile the core part only, does not work
         # for i, block in enumerate(model.visual.blocks):
