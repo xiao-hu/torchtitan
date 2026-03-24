@@ -33,59 +33,103 @@ def apply_rotary_emb_mrope(
     xk: torch.Tensor,
     rope_cache: torch.Tensor,
     positions: Optional[torch.Tensor] = None,
+    mrope_section: list[int] = [24, 20, 20],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply multi-resolution RoPE for Qwen3-VL (handles 3D positions).
-    
-    For Qwen3-VL:
-    - positions shape: (3, bz, seqlen) for T, H, W dimensions  
-    - Each dimension uses 1/3 of head_dim for RoPE
-    
-    For regular text-only:
-    - positions shape: (bz, seqlen)
-    - Falls back to standard RoPE
+    Apply interleaved multi-resolution RoPE for Qwen3-VL.
+
+    Matches HF's Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope:
+    - Computes per-dimension frequencies from 3D position IDs
+    - Interleaves T/H/W frequencies: [THWTHWTHW...TT]
+    - mrope_section defines how many frequency pairs per dimension
+
+    For text-only (2D positions), falls back to standard RoPE.
     """
-    # Check if we have 3D positions (Qwen3-VL mode)
     if positions is not None and positions.dim() == 3:
-        # Multi-resolution RoPE for vision + text
-        assert positions.shape[0] == 3, f"Expected 3 dimensions for MroPE, got {positions.shape[0]}"
-        
+        assert positions.shape[0] == 3
         bz, seqlen, n_heads, head_dim = xq.shape
-        
-        # Split head_dim into 3 parts for T, H, W
-        part_dim = head_dim // 3
-        
-        xq_out = torch.empty_like(xq)
-        xk_out = torch.empty_like(xk)
-        
-        # Apply RoPE to each dimension separately
-        for dim_idx in range(3):
-            # Get positions for this dimension: (bz, seqlen)
-            dim_positions = positions[dim_idx]
-            
-            # Get the corresponding slice of head_dim and rope_cache
-            start_idx = dim_idx * part_dim
-            end_idx = start_idx + part_dim if dim_idx < 2 else head_dim  # Last part gets remainder
-            actual_part_dim = end_idx - start_idx
-            
-            xq_part = xq[..., start_idx:end_idx]
-            xk_part = xk[..., start_idx:end_idx]
-            
-            # Slice rope_cache to match this part's dimension
-            # rope_cache shape: (max_seq_len, head_dim * 2)
-            # We need: (max_seq_len, actual_part_dim * 2)
-            rope_start = start_idx * 2  # *2 because cache has both cos and sin
-            rope_end = rope_start + actual_part_dim * 2
-            rope_cache_part = rope_cache[:, rope_start:rope_end]
-            
-            # Apply standard RoPE to this part
-            xq_part, xk_part = qwen3_apply_rotary_emb(
-                xq_part, xk_part, rope_cache_part, dim_positions
-            )
-            
-            xq_out[..., start_idx:end_idx] = xq_part
-            xk_out[..., start_idx:end_idx] = xk_part
-        
+
+        # rope_cache: (max_seq_len, head_dim * 2) with interleaved [cos, sin]
+        # Split into cos and sin halves
+        half_dim = head_dim // 2  # = 64 for head_dim=128
+        # rope_cache layout: (max_seq_len, head_dim) where first half_dim is one set
+
+        # Compute frequencies for each dimension using the shared inv_freq
+        # inv_freq has dim head_dim//2 entries, position_ids are (3, bz, seqlen)
+        # We need to compute freqs = inv_freq * position_ids for each of 3 dims
+        # Then interleave according to mrope_section
+
+        # Extract inv_freq from rope_cache (row 0 and row 1 give us the base)
+        # Actually, rope_cache is precomputed as (seq, head_dim*2) where
+        # rope_cache[pos] = [cos(freq*pos), sin(freq*pos)] interleaved
+        # We need to recompute from position_ids, not use positional lookup
+
+        # Use the same approach as HF: compute freqs from inv_freq * positions
+        # inv_freq shape: (head_dim // 2,)
+        # We can extract it from rope_cache: at position 1, cos(freq*1) = cos(freq)
+        # But it's cleaner to just use the rope_cache lookup per dimension
+
+        # For each position dim, look up rope_cache at those positions
+        # rope_cache[pos] gives (head_dim * 2,) = [cos0, sin0, cos1, sin1, ...]
+        # We need the first head_dim values (cos) and second head_dim values (sin)
+
+        # Actually rope_cache in TorchTitan Qwen3 is:
+        # shape (max_seq, head_dim) with complex-like layout
+        # Let me check the actual format...
+
+        # The simplest correct approach: compute cos/sin per dimension,
+        # then interleave and apply, matching HF exactly.
+
+        # Step 1: For each T/H/W dimension, gather rope values at those positions
+        # positions: (3, bz, seqlen)
+        # rope_cache: (max_seq_len, D) where D = head_dim (cos part) or head_dim*2
+
+        # rope_cache: (max_seq, head_dim * 2) where first head_dim = cos, second = sin
+        # cos_cache[pos] has head_dim values: cos(freq_0 * pos), cos(freq_1 * pos), ...
+        # But rope_cache was built with cat([theta, theta]) before cos/sin,
+        # so cos_cache[pos] = [cos(f0*p), cos(f1*p), ..., cos(f63*p), cos(f0*p), ..., cos(f63*p)]
+        # i.e., it's doubled: first half_dim entries = second half_dim entries
+        cos_cache = rope_cache[:, :head_dim]   # (max_seq, head_dim=128)
+        sin_cache = rope_cache[:, head_dim:]   # (max_seq, head_dim=128)
+        # Only need half_dim unique values (first 64 of the 128)
+        half_dim = head_dim // 2
+        cos_cache_half = cos_cache[:, :half_dim]  # (max_seq, 64)
+        sin_cache_half = sin_cache[:, :half_dim]
+
+        # Step 2: Gather per-dimension frequencies at position IDs
+        freqs_cos = []
+        freqs_sin = []
+        for d in range(3):
+            pos_d = positions[d].long()  # (bz, seqlen)
+            freqs_cos.append(cos_cache_half[pos_d])  # (bz, seqlen, 64)
+            freqs_sin.append(sin_cache_half[pos_d])
+
+        # Step 3: Interleave per HF's apply_interleaved_mrope
+        # In the half_dim=64 frequency array:
+        #   Start with T (dim 0), then overwrite H (dim 1) and W (dim 2) at interleaved positions
+        cos_interleaved = freqs_cos[0].clone()
+        sin_interleaved = freqs_sin[0].clone()
+        for dim_idx, offset in enumerate((1, 2), start=1):
+            length = mrope_section[dim_idx] * 3
+            idx = slice(offset, length, 3)
+            cos_interleaved[..., idx] = freqs_cos[dim_idx][..., idx]
+            sin_interleaved[..., idx] = freqs_sin[dim_idx][..., idx]
+
+        # Step 4: Apply rotary embedding
+        # Expand to full head_dim: [cos_half, cos_half] to match rotate_half pattern
+        cos_full = torch.cat([cos_interleaved, cos_interleaved], dim=-1)  # (bz, seqlen, head_dim=128)
+        sin_full = torch.cat([sin_interleaved, sin_interleaved], dim=-1)
+        cos_full = cos_full.unsqueeze(2)  # (bz, seqlen, 1, head_dim)
+        sin_full = sin_full.unsqueeze(2)
+
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        xq_out = (xq * cos_full) + (rotate_half(xq) * sin_full)
+        xk_out = (xk * cos_full) + (rotate_half(xk) * sin_full)
+
         return xq_out, xk_out
     else:
         # Standard RoPE for text-only

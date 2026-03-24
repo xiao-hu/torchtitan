@@ -149,10 +149,12 @@ class Qwen3VLStateDictAdapter(Qwen3StateDictAdapter):
             if key.startswith("model.visual."):
                 # Vision encoder: strip model. prefix and convert names for native encoder
                 tt_key = key.replace("model.", "", 1)
-                # Conv3d patch embed → Linear: reshape weight
+                # Conv3d patch embed → Linear: reshape weight and rename
                 if tt_key == "visual.patch_embed.proj.weight":
-                    # Conv3d weight: (out, in, t, h, w) → Linear: (out, in*t*h*w)
                     value = value.reshape(value.shape[0], -1)
+                    tt_key = "visual.patch_embed.weight"
+                elif tt_key == "visual.patch_embed.proj.bias":
+                    tt_key = "visual.patch_embed.bias"
                 # Rename MLP layers: linear_fc1 → fc1, linear_fc2 → fc2
                 tt_key = tt_key.replace(".linear_fc1.", ".fc1.").replace(".linear_fc2.", ".fc2.")
                 vision_dict[tt_key] = value

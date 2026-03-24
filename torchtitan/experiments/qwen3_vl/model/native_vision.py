@@ -399,40 +399,19 @@ class Qwen3VLNativeVisionEncoder(nn.Module):
             device=device,
         )
 
-    @torch.compiler.disable
     def _spatial_merge(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
         merger: VisionPatchMerger,
     ) -> torch.Tensor:
         """Apply spatial merge: group merge_size x merge_size patches and project.
 
-        Args:
-            hidden_states: (total_patches, hidden_size)
-            grid_thw: (num_images, 3)
-            merger: VisionPatchMerger module
-
-        Returns:
-            (total_merged_patches, out_hidden_size)
+        Hidden states are already in merge-permuted order from position embedding
+        (fast_pos_embed_interpolate permutes patches into (h//m, w//m, m, m) layout).
+        So we just reshape to group consecutive merge_size^2 patches, matching HF.
         """
-        merge_size = self.spatial_merge_size
-        grid_thw_list = grid_thw.tolist()
-
-        # Split by image, reshape for merging, cat back
-        sizes = [int(t) * int(h) * int(w) for t, h, w in grid_thw_list]
-        splits = torch.split(hidden_states, sizes)
-
-        merged = []
-        for chunk, (t, h, w) in zip(splits, grid_thw_list):
-            t, h, w = int(t), int(h), int(w)
-            # Reshape: (t*h*w, D) → (t, h//m, m, w//m, m, D) → (t, h//m, w//m, m*m*D)
-            chunk = (
-                chunk.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .reshape(t * (h // merge_size) * (w // merge_size), -1)
-            )
-            merged.append(chunk)
-
-        merged_states = torch.cat(merged, dim=0)
+        merge_dim = self.spatial_merge_size ** 2
+        # Simple view: consecutive groups of merge_dim patches → one merged token
+        merged_states = hidden_states.view(-1, merge_dim * hidden_states.shape[-1])
         return merger(merged_states)
 
     def forward(
